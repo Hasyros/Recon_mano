@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.env/
+
+# Recon scan outputs / target data (not source code)
+/output/
+resume.cfg
+/boulangerie-croustille78.eatbu.com/
+/eatbu.com/
+/devinci.fr/
+/echosdunet.net/
+/lidle.com/
+/lidle.fr/
+/verda.com/
+
+# Editor
+.vscode/

@@ -1,0 +1,3 @@
+- [ ] Project: Python recon workflow with subfinder, dnsx, httpx, urlfinder, katana
+- [ ] Create CLI wrapper that runs external reconnaissance tools
+- [ ] Provide README.md and tasks.json for running the pipeline

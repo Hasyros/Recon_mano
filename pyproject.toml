@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recon_mano"
+version = "0.1.0"
+description = "Orchestration reconnaissance tools for subfinder, dnsx, httpx, urlfinder, and katana."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+# httpx (client Python) n'est PAS une dépendance : le pipeline appelle le binaire
+# httpx de ProjectDiscovery. L'inclure installerait un script `httpx` qui masque
+# ce binaire dans le PATH.
+dependencies = [
+  "typer",
+  "rich",
+]
+
+[project.scripts]
+recon_mano = "recon_mano.cli:entrypoint"
+recon-mano = "recon_mano.cli:entrypoint"
+
+[tool.setuptools]
+packages = ["recon_mano"]
