@@ -226,7 +226,7 @@ def run_command(
         if _VERBOSE:
             console.print(f"[dim cyan]$ {' '.join(full)}[/dim cyan]")
             try:
-                proc = subprocess.Popen(full, stderr=subprocess.PIPE, stdout=out_target, text=True, bufsize=1)
+                proc = subprocess.Popen(full, stderr=subprocess.PIPE, stdout=out_target, text=True, encoding="utf-8", errors="replace", bufsize=1)
             except FileNotFoundError:
                 console.print(f"[bold red]Binaire introuvable :[/bold red] {full[0]}")
                 return 127, 0.0, ""
