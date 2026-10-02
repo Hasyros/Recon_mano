@@ -157,6 +157,7 @@ Options utiles :
 | `-v`, `--verbose` | Affiche les commandes exactes et le flux des outils en direct |
 | `--check` | Vérifie la présence des outils puis quitte |
 | `--all-sources` | `subfinder -all` (plus lent, plus complet) |
+| `--subdomains` | Sous-domaines déjà connus (fichier ou liste virgulée, ex: trouvés via `ffuf`) : ignore l'étape subfinder et part directement de cette liste |
 | `--no-wildcard-filter` | Désactive `dnsx -wd` |
 | `--match-codes` | Codes retenus par httpx (défaut : large, 401/403/500 compris) |
 | `--depth` | Profondeur katana (défaut 2 — les seeds sont déjà profondes) |

@@ -1,20 +1,25 @@
+# Liste blanche : on ignore tout à la racine par défaut, puis on ne garde que
+# le projet lui-même. Les sorties de scan créent des dossiers arbitraires
+# nommés d'après la cible (ex: devinci.fr/, eero.com/...) — impossible à
+# énumérer à l'avance, donc plus sûr que de les lister un par un.
+/*
+
+!/.claude/
+!/.github/
+!/.gitattributes
+!/.gitignore
+!/README.md
+!/WORKFLOW.md
+!/pyproject.toml
+!/requirements.txt
+!/recon_mano/
+
 # Python
 __pycache__/
 *.pyc
 *.egg-info/
 .venv/
 .env/
-
-# Recon scan outputs / target data (not source code)
-/output/
-resume.cfg
-/boulangerie-croustille78.eatbu.com/
-/eatbu.com/
-/devinci.fr/
-/echosdunet.net/
-/lidle.com/
-/lidle.fr/
-/verda.com/
 
 # Editor
 .vscode/

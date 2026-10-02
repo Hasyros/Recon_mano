@@ -267,7 +267,7 @@ def run_command(
             return proc.returncode, elapsed, ""
 
         try:
-            proc = subprocess.Popen(full, stderr=subprocess.PIPE, stdout=out_target, text=True)
+            proc = subprocess.Popen(full, stderr=subprocess.PIPE, stdout=out_target, text=True, encoding="utf-8", errors="replace")
         except FileNotFoundError:
             console.print(f"[bold red]Binaire introuvable :[/bold red] {full[0]}")
             return 127, 0.0, ""
@@ -445,6 +445,19 @@ def stage_subfinder(target: str, destination: Path, all_sources: bool) -> tuple[
         command.append("-all")
     _, elapsed, _ = run_command(command, "subfinder", watch=destination)
     return write_lines(destination, read_lines(destination)), elapsed
+
+
+def load_provided_subdomains(spec: str) -> List[str]:
+    """Parse --subdomains : chemin de fichier (un hôte par ligne) ou liste
+    séparée par des virgules/espaces. Un hôte peut aussi être une URL complète
+    (http(s)://...) — seul le nom d'hôte sera gardé par les étapes suivantes."""
+    spec = spec.strip()
+    if not spec:
+        return []
+    candidate = Path(spec)
+    if candidate.is_file():
+        return read_lines(candidate)
+    return [h.strip() for h in spec.replace("\n", ",").replace(" ", ",").split(",") if h.strip()]
 
 
 def stage_dnsx(source: Path, destination: Path, target: str, wildcard: bool) -> tuple[int, float]:
@@ -749,6 +762,12 @@ def main(
     clean: bool = typer.Option(False, "--clean", help="Supprime les anciens fichiers de sortie avant de lancer"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Affiche les commandes et le flux des outils"),
     all_sources: bool = typer.Option(False, "--all-sources", help="subfinder -all (plus lent)"),
+    subdomains: str = typer.Option(
+        "", "--subdomains",
+        help="Sous-domaines déjà connus (ex: trouvés via ffuf) : fichier (un par ligne) ou liste "
+             "séparée par des virgules. Si fourni, l'étape subfinder est ignorée et le scan part "
+             "directement de cette liste.",
+    ),
     wildcard_filter: bool = typer.Option(
         True, "--wildcard-filter/--no-wildcard-filter", help="dnsx -wd (filtrage wildcard)"
     ),
@@ -891,9 +910,17 @@ def main(
             raise typer.Exit(code=1)
 
     # --- Branche 1 : hôtes -------------------------------------------------- #
-    stage_header("1/6", "subfinder", "sous-domaines théoriques")
-    count, elapsed = stage_subfinder(target, subfinder_file, all_sources)
-    report(count, subfinder_file, elapsed)
+    provided_hosts = load_provided_subdomains(subdomains)
+    if provided_hosts:
+        stage_header("1/6", "subfinder", "sous-domaines fournis (--subdomains)")
+        count = write_lines(subfinder_file, provided_hosts)
+        elapsed = 0.0
+        report(count, subfinder_file, elapsed)
+        console.print("  [dim]Liste fournie — étape subfinder ignorée.[/dim]")
+    else:
+        stage_header("1/6", "subfinder", "sous-domaines théoriques")
+        count, elapsed = stage_subfinder(target, subfinder_file, all_sources)
+        report(count, subfinder_file, elapsed)
     summary.append(("subfinder", count, elapsed))
     if not count:
         console.print("[bold red]Aucun sous-domaine trouvé, arrêt.[/bold red]")

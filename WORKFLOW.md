@@ -270,6 +270,10 @@ recon_mano cible.com output --clean --nuclei
 # Débug / test urlfinder seul (voir §5)
 recon_mano cible.com output --skip-dnsx --skip-httpx --skip-katana
 
+# Sous-domaines déjà trouvés (ex: ffuf) : saute subfinder, part de cette liste
+recon_mano cible.com output --subdomains sub1.cible.com,sub2.cible.com
+recon_mano cible.com output --subdomains mes_sous_domaines.txt
+
 # Voir les commandes et le flux temps réel des outils
 recon_mano cible.com output -v
 ```
@@ -355,6 +359,7 @@ urlfinder -d cible.com -all -cs -jsonl -silent \
 | `--clean` | Supprime les anciens fichiers de sortie avant de lancer | off |
 | `-v`, `--verbose` | Affiche les commandes et le flux des outils | off |
 | `--all-sources` | `subfinder -all` (plus lent) | off |
+| `--subdomains` | Sous-domaines déjà connus (fichier un-par-ligne ou liste virgulée) : ignore subfinder, part directement de cette liste | `` |
 | `--wildcard-filter` / `--no-wildcard-filter` | `dnsx -wd` | on |
 | `--match-codes` | `httpx -mc` | `200,204,301,302,307,308,401,403,405,500,502,503` |
 | `--depth` | Profondeur katana | `2` |
