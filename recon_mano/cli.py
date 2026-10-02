@@ -454,9 +454,15 @@ def load_provided_subdomains(spec: str) -> List[str]:
     spec = spec.strip()
     if not spec:
         return []
-    candidate = Path(spec)
-    if candidate.is_file():
-        return read_lines(candidate)
+    try:
+        # Une longue liste virgulée dépasse souvent la limite de longueur d'un
+        # nom de fichier (ENAMETOOLONG) : is_file() lève alors une OSError au
+        # lieu de renvoyer False — on la traite comme « ce n'est pas un fichier ».
+        is_file = Path(spec).is_file()
+    except OSError:
+        is_file = False
+    if is_file:
+        return read_lines(Path(spec))
     return [h.strip() for h in spec.replace("\n", ",").replace(" ", ",").split(",") if h.strip()]
 
 
