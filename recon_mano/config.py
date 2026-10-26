@@ -16,7 +16,9 @@ Règles de fond rappelées ici :
 - **nuclei est le seul module opt-in** (`-n`) : `enabled=False` ici, quel que soit le preset.
 - Les modules qui frappent la cible (`network=True`) ont un débit en req/s, plafonné
   par le budget global `--max-rps`. crtsh, gau et waybackurls interrogent des
-  services publics (crt.sh, archives), pas la cible : `network=False`.
+  services publics (crt.sh, archives), pas la cible : `network=False`. jsluice et
+  secrets ne lisent que des fichiers locaux (réponses stockées par katana) :
+  `network=False` aussi. takeover est `network=True` (subzy récupère les hôtes).
 - Un timeout `None` = illimité (comportement historique des outils existants) ;
   il est exprimé en secondes ici, en minutes sur la CLI.
 """
@@ -34,7 +36,8 @@ class ModuleDefaults:
     rate: int = 0                     # req/s demandées (si network)
     timeout: Optional[int] = None     # secondes ; None = illimité
     params: Dict[str, Any] = field(default_factory=dict)
-    binaries: Tuple[str, ...] = ()    # binaires externes requis (informatif)
+    binaries: Tuple[str, ...] = ()    # binaires externes requis (tous)
+    binaries_any: Tuple[str, ...] = ()  # au moins un de ces binaires (ex. trufflehog OU gitleaks)
     note: str = ""
 
 
@@ -58,10 +61,43 @@ MODULE_DEFAULTS: Dict[str, ModuleDefaults] = {
     ),
     "httpx": ModuleDefaults(binaries=("httpx",), network=True, rate=150, params={"threads": 50}),
     "nuclei1": ModuleDefaults(enabled=False, binaries=("nuclei",), network=True, rate=50, note="opt-in (-n)"),
-    "katana": ModuleDefaults(binaries=("katana",), network=True, rate=150, params={"concurrency": 10}),
+    # katana passe AVANT takeover / naabu : à budget égal il garde la priorité (nuclei #1 50 + katana 100).
+    "katana": ModuleDefaults(
+        binaries=("katana",), network=True, rate=150, params={"concurrency": 10, "store": True},
+        note="stocke les réponses (responses/katana) pour jsluice et secrets",
+    ),
+    "takeover": ModuleDefaults(
+        binaries=("dnsx",), network=True, rate=10, timeout=15 * 60,
+        params={"concurrency": 5, "http_timeout": 10},
+        note="CNAME hors périmètre (dnsx) puis subzy sur ces seuls candidats ; sans subzy : liste de candidats seule",
+    ),
+    "naabu": ModuleDefaults(
+        binaries=("naabu",), network=True, rate=100, timeout=30 * 60,
+        params={"ports": "top-1000", "allow_full": False}, note="hôtes vivants seulement, -exclude-cdn",
+    ),
+    "httpx_ports": ModuleDefaults(
+        binaries=("httpx",), network=True, rate=50, timeout=15 * 60, note="services web hors 80/443 trouvés par naabu",
+    ),
+    "nuclei_ports": ModuleDefaults(
+        enabled=False, binaries=("nuclei",), network=True, rate=50, timeout=30 * 60,
+        note="opt-in (-n) : réglages de la passe 1 sur les services web hors 80/443",
+    ),
+    "jsluice": ModuleDefaults(
+        binaries=("jsluice",), timeout=10 * 60, params={"concurrency": 4, "max_bytes": 5_000_000},
+        note="lit les JS stockés par katana (aucune requête)",
+    ),
+    "secrets": ModuleDefaults(
+        binaries_any=("trufflehog", "gitleaks"), timeout=10 * 60,
+        note="trufflehog (sans vérification) sinon gitleaks, sur les réponses stockées (aucune requête)",
+    ),
     "merge_map": ModuleDefaults(params={"archive_dedupe": True, "archive_k": 3}),
     "httpx2": ModuleDefaults(binaries=("httpx",), network=True, rate=150),
     "tree": ModuleDefaults(),
+    "arjun": ModuleDefaults(
+        binaries=("arjun",), network=True, rate=20, timeout=30 * 60,
+        params={"max_urls": 30, "threads": 2, "http_timeout": 15, "stable": False},
+        note="paramètres cachés sur ≤ 30 URLs représentatives, débit accordé via --rate-limit",
+    ),
     "nuclei2": ModuleDefaults(enabled=False, binaries=("nuclei",), network=True, rate=150, note="opt-in (-n)"),
 }
 

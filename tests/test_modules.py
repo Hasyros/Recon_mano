@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import threading
@@ -20,6 +21,18 @@ from recon_mano.scope import ScopeFilter
 
 HOSTS = ["www.example.com", "api.example.com", "evil.net"]
 ARCHIVE = ["https://www.example.com/old", "https://cdn.thirdparty.io/x.js"]
+
+# Secrets factices : ne doivent apparaître ENTIERS ni dans la console ni dans 10_secrets.txt.
+FAKE_KEY = "AKIAIOSFODNN7EXAMPLE"
+FAKE_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+JS_URL = "https://www.example.com/static/app.js"
+THIRD_PARTY_JS_URL = "https://cdn.thirdparty.io/lib.js"
+PAGE_URL = "https://www.example.com/"
+# Ce que « jsluice urls » croit voir dans app.js.
+JSLUICE_ENDPOINTS = [
+    "/api/v2/items?id=EXPR", "../up", "//cdn.thirdparty.io/x", "https://api.example.com/graphql",
+    "EXPR/x", "/assets/logo.png", "javascript:void(0)", "lib/rel",
+]
 
 
 def fake_status(url):
@@ -79,7 +92,8 @@ class FakeTools:
 
     def __init__(self, all_404=False, hosts=HOSTS, archive=ARCHIVE, waf_hosts=(), delays=None,
                  gf_hits=None, truncate_nuclei=False, amass_names=(), gau_urls=(), wayback_urls=(),
-                 amass_rc=0, codes=None, unreachable=()):
+                 amass_rc=0, codes=None, unreachable=(), open_ports=(443, 8080), extra_ports=(), cnames=None,
+                 vulnerable=None, arjun_hits=None, store=True):
         self.calls: list = []
         self.commands: list = []
         self.spans: dict = {}
@@ -96,9 +110,35 @@ class FakeTools:
         self.amass_rc = amass_rc
         self.codes = codes or {}               # URL -> code imposé
         self.unreachable = set(unreachable)    # URLs que httpx n'écrit pas (timeout / refus de connexion)
+        self.open_ports = tuple(open_ports)    # ports « ouverts » rendus par naabu pour chaque hôte
+        self.extra_ports = list(extra_ports)   # (hôte, port) en plus (ex. hors périmètre)
+        self.cnames = {"www.example.com": ["target-app.herokudns.com."]} if cnames is None else cnames
+        self.vulnerable = vulnerable           # None = tous les candidats subzy sont vulnérables
+        self.arjun_hits = arjun_hits           # None = arjun trouve ["debug"] sur toutes ses URLs
+        self.arjun_inputs: list = []
+        self.store = store                     # katana stocke ses réponses si on le lui demande
         self.wayback_stdin = ""
         self.silent: dict = {}                 # label -> valeur du paramètre `silent` reçu
         self.lock = threading.Lock()
+
+    def _store_responses(self, directory):
+        """Ce que katana -store-response écrit : <dir>/<hôte>/<sha1>.txt + index.txt (format vérifié en amont)."""
+        index = []
+        pages = [
+            (JS_URL, "application/javascript", f'var k="{FAKE_KEY}"; fetch("/api/v2/items?id="+x);'),
+            (THIRD_PARTY_JS_URL, "application/javascript", f'var z="{FAKE_SECRET}";'),
+            (PAGE_URL, "text/html", "<html><script>var inline=1</script></html>"),
+        ]
+        for url, content_type, body in pages:
+            host = urlparse(url).netloc.replace(":", "_")
+            folder = directory / host
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / (hashlib.sha1(url.encode()).hexdigest() + ".txt")
+            request = f"GET {urlparse(url).path or '/'} HTTP/1.1\r\nHost: {host}\r\n\r\n"
+            response = f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\r\n{body}"
+            target.write_bytes(f"{url}\n\n\n{request}\n\n{response}".encode())    # octets exacts (pas de \r\n doublés sous Windows)
+            index.append(f"{target} {url} (200 OK)")
+        (directory / "index.txt").write_text("\n".join(index) + "\n", encoding="utf-8")
 
     def of(self, label):
         """Commandes lancées sous cette étiquette (ex. « nuclei #1 »)."""
@@ -117,6 +157,10 @@ class FakeTools:
         if tool == "subfinder":
             time.sleep(0.15)
             Path(arg("-o")).write_text("\n".join(self.hosts) + "\n", encoding="utf-8")
+        elif tool == "dnsx" and "-cname" in command:
+            hosts = Path(arg("-l")).read_text(encoding="utf-8").split()
+            rows = [{"host": h, "cname": self.cnames[h], "status_code": "NOERROR"} for h in hosts if h in self.cnames]
+            Path(arg("-o")).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
         elif tool == "dnsx":
             hosts = Path(arg("-l")).read_text(encoding="utf-8").split()
             Path(arg("-o")).write_text("\n".join(h for h in hosts if "api" not in h) + "\n", encoding="utf-8")
@@ -153,6 +197,59 @@ class FakeTools:
             seeds = Path(arg("-list")).read_text(encoding="utf-8").split()
             found = [s.rstrip("/") + "/admin" for s in seeds] + ["https://thirdparty.io/y"]
             Path(arg("-o")).write_text("\n".join(found) + "\n", encoding="utf-8")
+            if "-store-response-dir" in command and self.store:
+                self._store_responses(Path(arg("-store-response-dir")))
+        elif tool == "jsluice":
+            files = stdin_from.read_text(encoding="utf-8").split()
+            if command[1] == "urls":
+                rows = [{"url": u, "queryParams": [], "method": "GET", "type": "fetch", "filename": f}
+                        for f in files for u in JSLUICE_ENDPOINTS]
+            else:
+                rows = [{"kind": "AWSAccessKey", "data": {"key": FAKE_KEY, "secret": FAKE_SECRET}, "severity": "high",
+                         "filename": f, "context": {}} for f in files]
+            stdout_to.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        elif tool == "trufflehog":
+            index = Path(command[2]) / "index.txt"
+            rows = []
+            for line in index.read_text(encoding="utf-8").splitlines():
+                file, url = line.split(" ")[0], line.split(" ")[1]
+                if url.endswith(".js"):
+                    rows.append({
+                        "DetectorName": "AWS", "Raw": FAKE_SECRET, "Verified": False, "RawV2": FAKE_KEY + FAKE_SECRET,
+                        "SourceMetadata": {"Data": {"Filesystem": {"file": file, "line": 3}}},
+                    })
+            stdout_to.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        elif tool == "gitleaks":
+            index = Path(command[2 if command[1] == "dir" else 5]) / "index.txt"
+            rows = []
+            for line in index.read_text(encoding="utf-8").splitlines():
+                file, url = line.split(" ")[0], line.split(" ")[1]
+                if url.endswith(".js"):
+                    rows.append({"RuleID": "aws-access-token", "File": file, "Secret": FAKE_SECRET, "StartLine": 3})
+            Path(arg("--report-path")).write_text(json.dumps(rows), encoding="utf-8")
+        elif tool == "subzy":
+            targets = Path(arg("--targets")).read_text(encoding="utf-8").split()
+            rows = []
+            for host in targets:
+                bad = self.vulnerable is None or host in self.vulnerable
+                rows.append({
+                    "subdomain": host, "status": "vulnerable" if bad else "not vulnerable", "vulnerable": bad,
+                    "engine": "Heroku", "cname": self.cnames.get(host, []),
+                })
+            Path(arg("--output")).write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        elif tool == "naabu":
+            hosts = Path(arg("-list")).read_text(encoding="utf-8").split()
+            rows = [{"host": h, "ip": "192.0.2.1", "port": p} for h in hosts for p in self.open_ports]
+            rows += [{"host": h, "ip": "192.0.2.9", "port": p} for h, p in self.extra_ports]
+            Path(arg("-o")).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        elif tool == "arjun":
+            urls = Path(arg("-i")).read_text(encoding="utf-8").split()
+            with self.lock:
+                self.arjun_inputs.append(urls)
+            hits = urls if self.arjun_hits is None else [u for u in urls if u in self.arjun_hits]
+            result = {u: {"params": ["debug"], "method": "GET", "headers": {}} for u in hits}
+            if result:
+                Path(arg("-oJ")).write_text(json.dumps(result, indent=4), encoding="utf-8")
         elif tool == "nuclei":
             targets = Path(arg("-l")).read_text(encoding="utf-8").split()
             severity = "high" if "-dast" in command else ("medium" if "-as" in command else "info")

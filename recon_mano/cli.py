@@ -4,15 +4,18 @@ Pipeline : des modules indépendants, lancés par un ordonnanceur dès que leurs
 dépendances sont terminées (voir `pipeline.py` et `modules.py`)::
 
     cible ─┬─ subfinder ─┐
-           ├─ crtsh ─────┼─ subdomains ── dnsx ──┐          ┌─ katana ──────────┐
-           ├─ amass ─────┘                       ├─ httpx ──┤                   ├─ merge_map ── httpx #2 ─┬─ tree
-           └─ urlfinder ─────────────────────────┘          └─ nuclei #1 (opt-in)│                         └─ nuclei #2 (opt-in)
-                  └─ gau ── waybackurls ───────────────────────────────────────┘
+           ├─ crtsh ─────┼─ subdomains ── dnsx ─┬─ takeover (CNAME → subzy)
+           ├─ amass ─────┘                      ├─ naabu ── httpx ports ── nuclei ports (opt-in) ──┐
+           └─ urlfinder ────────────────────────┴─ httpx ──┬─ katana ─┬─ jsluice ─┬─ secrets          │
+                  └─ gau ── waybackurls ───────────────┐   │          │           │                  │
+                                                       └───┴─ merge_map ── httpx #2 ──┬─ tree ◄─────┘
+                                          nuclei #1 (opt-in, ‖ katana)                 └─ arjun ── nuclei #2 (opt-in)
 
 subfinder (-all), crtsh (Python), amass (passif) et urlfinder n'ont aucune dépendance :
 ils tournent en parallèle. Les archives sont sérialisées (urlfinder → gau → waybackurls).
-`--workers` borne les modules simultanés, `--max-rps` le débit total vers la cible
-(budget global partagé par httpx, katana et nuclei). Chaque run écrit
+katana stocke ses réponses : jsluice (endpoints, secrets) et secrets (trufflehog sans vérification,
+sinon gitleaks) les lisent hors ligne. `--workers` borne les modules simultanés, `--max-rps` le débit
+total vers la cible (budget global partagé par httpx, katana, takeover, naabu, arjun et nuclei). Chaque run écrit
 `run_config.json` (périmètre, codes) et `run_stats.json` (durées par module).
 Tout est actif par défaut sauf nuclei (`-n`, jamais par défaut), qui tourne en deux
 passes : par hôte pendant le crawl, puis par URL représentative en fin de pipeline.
@@ -47,6 +50,7 @@ from .liveness import DEFAULT_LIVE_CODES, parse_codes
 from .merge import merge_folder
 from .findings import severity_line
 from .config import MODULE_DEFAULTS, default_param, default_timeout_minutes, parse_module_timeouts
+from .surface import port_flags
 from .modules import (  # noqa: F401 — ré-exportés pour compatibilité
     DEFAULT_MATCH_CODES,
     Options,
@@ -58,9 +62,10 @@ from .modules import (  # noqa: F401 — ré-exportés pour compatibilité
     live_lists,
     load_provided_subdomains,
     merge_files,
+    produced,
     resolve_nuclei_passes,
 )
-from .pipeline import ARTIFACTS, Context, Scheduler, build_paths, write_run_config
+from .pipeline import ARTIFACT_DIRS, ARTIFACTS, DEFAULT_WORKERS, Context, Scheduler, build_paths, write_run_config
 from .report import write_report as write_tree_report
 from .runner import resolve_httpx, run_command  # noqa: F401
 from .scope import ScopeFilter, host_of, in_scope, parse_domains, scope_urls  # noqa: F401
@@ -77,13 +82,22 @@ REQUIRED_TOOLS = ["subfinder", "dnsx", "httpx", "urlfinder", "katana"]
 
 # Anciens fichiers qu'un --clean doit aussi emporter (nuclei mono-passe, avant les deux passes)
 # et le fichier temporaire de waybackurls (laissé par un run interrompu).
-LEGACY_ARTIFACTS = ["07_nuclei_input.txt", ".waybackurls_domains.tmp"]
+LEGACY_ARTIFACTS = [
+    "07_nuclei_input.txt", ".waybackurls_domains.tmp",
+    ".jsluice_files.tmp", ".jsluice_urls.tmp", ".secrets.tmp", ".subzy.tmp",
+]
 
 # Outils optionnels : (binaire, module qu'il active, ce qui se passe sans lui).
 OPTIONAL_TOOLS = [
     ("amass", "amass", "sans lui, pas de sous-domaines amass (passif)"),
     ("gau", "gau", "sans lui, pas d'URLs d'archives gau"),
     ("waybackurls", "waybackurls", "sans lui, pas d'URLs waybackurls"),
+    ("jsluice", "jsluice", "sans lui, pas d'endpoints ni de secrets extraits du JS"),
+    ("trufflehog", "secrets", "sans lui ni gitleaks, pas de recherche de secrets (module secrets désactivé)"),
+    ("gitleaks", "secrets (repli de trufflehog)", "repli utilisé seulement si trufflehog est absent"),
+    ("subzy", "takeover", "sans lui, takeover n'écrit que la liste de candidats (CNAME hors périmètre ; dnsx requis)"),
+    ("naabu", "naabu, httpx_ports, nuclei_ports", "sans lui, pas de scan de ports ni de services hors 80/443"),
+    ("arjun", "arjun", "sans lui, pas de paramètres cachés"),
     ("nuclei", "nuclei (--nuclei)", "nécessaire seulement avec --nuclei"),
     ("gf", "nuclei passe 2", "repli sur une liste interne de paramètres suspects"),
 ]
@@ -107,6 +121,11 @@ def clean_artifacts(output: Path) -> None:
                 removed += 1
             except OSError as exc:
                 console.print(f"[yellow]Impossible de supprimer {target.name} : {exc}[/yellow]")
+    for name in ARTIFACT_DIRS.values():       # réponses stockées par katana (responses/)
+        folder = output / name
+        if folder.is_dir():
+            shutil.rmtree(folder, ignore_errors=True)
+            removed += 1
     console.print(f"[dim]Nettoyage : {removed} ancien(s) fichier(s) supprimé(s).[/dim]\n")
 
 
@@ -277,6 +296,90 @@ def main(
         default_param("merge_map", "archive_k"), "--archive-k", min=1,
         help="URLs gardées par signature (hôte + chemin templaté + noms de paramètres) pour gau/waybackurls",
     ),
+    katana_store: bool = typer.Option(
+        default_param("katana", "store"), "--katana-store/--no-katana-store",
+        help="katana -store-response : garde les réponses brutes dans <sortie>/responses/katana (index.txt + un fichier par "
+             "réponse ; plusieurs centaines de Mo sur un gros crawl, borné par --katana-max-pages). jsluice et secrets en "
+             "dépendent : sans elle ils sont ignorés.",
+    ),
+    jsluice: bool = typer.Option(
+        MODULE_DEFAULTS["jsluice"].enabled, "--jsluice/--no-jsluice",
+        help="jsluice (binaire optionnel) sur les JS stockés par katana : endpoints (→ carte, validés par httpx #2) et secrets. Aucune requête.",
+    ),
+    jsluice_timeout: int = typer.Option(
+        default_timeout_minutes("jsluice"), "--jsluice-timeout", min=0, help="jsluice : durée max du module, en minutes (défaut 10 ; 0 = illimité)",
+    ),
+    secrets: bool = typer.Option(
+        MODULE_DEFAULTS["secrets"].enabled, "--secrets/--no-secrets",
+        help="Secrets dans les réponses stockées : trufflehog --no-verification (jamais de vérification), sinon gitleaks. "
+             "Écrit 10_secrets.jsonl (secrets en clair, sensible) et 10_secrets.txt (masqué). Aucune requête.",
+    ),
+    secrets_timeout: int = typer.Option(
+        default_timeout_minutes("secrets"), "--secrets-timeout", min=0, help="secrets : durée max du module, en minutes (défaut 10 ; 0 = illimité)",
+    ),
+    takeover: bool = typer.Option(
+        MODULE_DEFAULTS["takeover"].enabled, "--takeover/--no-takeover",
+        help="Takeover : dnsx -cname sur les hôtes vivants, puis subzy sur ceux dont le CNAME sort du périmètre. "
+             "Sans subzy : liste de candidats seulement (11_takeover_candidates.txt).",
+    ),
+    takeover_timeout: int = typer.Option(
+        default_timeout_minutes("takeover"), "--takeover-timeout", min=0, help="takeover : durée max du module, en minutes (défaut 15 ; 0 = illimité)",
+    ),
+    takeover_rate: int = typer.Option(
+        MODULE_DEFAULTS["takeover"].rate, "--takeover-rate", min=1,
+        help="takeover : débit demandé (req/s, plafonné par --max-rps) ; la concurrence de subzy ne le dépasse jamais",
+    ),
+    takeover_concurrency: int = typer.Option(
+        default_param("takeover", "concurrency"), "--takeover-concurrency", min=1, help="subzy --concurrency (défaut 5 : prudent)",
+    ),
+    naabu: bool = typer.Option(
+        MODULE_DEFAULTS["naabu"].enabled, "--naabu/--no-naabu",
+        help="Scan de ports des hôtes vivants (naabu -exclude-cdn, binaire optionnel). Alimente httpx ports et, avec -n, nuclei ports.",
+    ),
+    ports: str = typer.Option(
+        default_param("naabu", "ports"), "--ports",
+        help="Ports naabu : top-100 | top-1000 (défaut) | liste (80,443,8080-8090). 'full' refusé sauf --naabu-allow-full.",
+    ),
+    naabu_allow_full: bool = typer.Option(
+        default_param("naabu", "allow_full"), "--naabu-allow-full/--no-naabu-allow-full",
+        help="Autorise --ports full (65535 ports par hôte : très long et bruyant). Désactivé par défaut.",
+    ),
+    naabu_timeout: int = typer.Option(
+        default_timeout_minutes("naabu"), "--naabu-timeout", min=0, help="naabu : durée max du module, en minutes (défaut 30 ; 0 = illimité)",
+    ),
+    naabu_rate: int = typer.Option(
+        MODULE_DEFAULTS["naabu"].rate, "--naabu-rate", min=1, help="naabu -rate demandé (sondes/s, plafonné par --max-rps ; défaut 100)",
+    ),
+    httpx_ports: bool = typer.Option(
+        MODULE_DEFAULTS["httpx_ports"].enabled, "--httpx-ports/--no-httpx-ports",
+        help="httpx sur les services hôte:port hors 80/443 trouvés par naabu ; ils rejoignent les listes finales et l'arbre.",
+    ),
+    httpx_ports_rate: int = typer.Option(
+        MODULE_DEFAULTS["httpx_ports"].rate, "--httpx-ports-rate", min=1, help="httpx ports : débit demandé (req/s, plafonné par --max-rps ; défaut 50)",
+    ),
+    arjun: bool = typer.Option(
+        MODULE_DEFAULTS["arjun"].enabled, "--arjun/--no-arjun",
+        help="arjun (binaire optionnel) : paramètres cachés sur quelques URLs vivantes représentatives → 14_arjun_params.txt. "
+             "Avec -n, ces URLs rejoignent le run DAST de nuclei #2.",
+    ),
+    arjun_max: int = typer.Option(
+        default_param("arjun", "max_urls"), "--arjun-max", min=1,
+        help="arjun : nombre maximum d'URLs testées (défaut 30 ; arjun envoie des centaines de requêtes par URL)",
+    ),
+    arjun_timeout: int = typer.Option(
+        default_timeout_minutes("arjun"), "--arjun-timeout", min=0, help="arjun : durée max du module, en minutes (défaut 30 ; 0 = illimité)",
+    ),
+    arjun_rate: int = typer.Option(
+        MODULE_DEFAULTS["arjun"].rate, "--arjun-rate", min=1, help="arjun --rate-limit demandé (req/s, plafonné par --max-rps ; défaut 20)",
+    ),
+    arjun_threads: int = typer.Option(
+        default_param("arjun", "threads"), "--arjun-threads", min=1, help="arjun -t (défaut 2)",
+    ),
+    arjun_stable: bool = typer.Option(
+        default_param("arjun", "stable"), "--arjun-stable/--no-arjun-stable",
+        help="arjun --stable : 1 thread et 3 à 9 s de pause par requête. Désactivé par défaut (module inutilisable de lenteur) ; "
+             "le débit est de toute façon borné par --arjun-rate.",
+    ),
     module_timeout: List[str] = typer.Option(
         [], "--module-timeout",
         help="Timeout d'un module, en minutes : nom=minutes (répétable, 0 = illimité), ex. --module-timeout katana=30. "
@@ -388,12 +491,15 @@ def main(
     skip_katana: bool = typer.Option(False, "--skip-katana"),
     max_rps: int = typer.Option(
         150, "--max-rps", min=1,
-        help="Budget de débit GLOBAL (req/s) partagé par les modules qui frappent la cible (httpx, katana, nuclei)",
+        help="Budget de débit GLOBAL (req/s) partagé par les modules qui frappent la cible (httpx, katana, takeover, naabu, arjun, nuclei)",
     ),
-    workers: int = typer.Option(4, "--workers", min=1, help="Nombre maximum de modules exécutés en parallèle"),
+    workers: int = typer.Option(
+        DEFAULT_WORKERS, "--workers", min=1,
+        help="Nombre maximum de modules exécutés en parallèle (défaut 6 ; le débit vers la cible reste plafonné par --max-rps)",
+    ),
     sequential: bool = typer.Option(False, "--sequential", help="Un module à la fois (= --workers 1) : débogage / comparaison"),
 ):
-    """Recon Mano — (subfinder ‖ crtsh ‖ amass) → dnsx → httpx → katana ‖ nuclei #1 → httpx #2 → nuclei #2 (opt-in) ; urlfinder → gau → waybackurls en parallèle.
+    """Recon Mano — (subfinder ‖ crtsh ‖ amass) → dnsx → httpx → katana (→ jsluice, secrets) ‖ nuclei #1 → httpx #2 → arjun → nuclei #2 (opt-in) ; dnsx → takeover, naabu → httpx ports ; urlfinder → gau → waybackurls en parallèle.
 
     Exemple : recon_mano exemple.com sortie -n
     """
@@ -441,8 +547,17 @@ def main(
         timeouts = {
             "amass": amass_timeout * 60 or None, "gau": gau_timeout * 60 or None,
             "waybackurls": waybackurls_timeout * 60 or None,
+            "jsluice": jsluice_timeout * 60 or None, "secrets": secrets_timeout * 60 or None,
+            "takeover": takeover_timeout * 60 or None, "naabu": naabu_timeout * 60 or None,
+            "arjun": arjun_timeout * 60 or None,
         }
         timeouts.update(parse_module_timeouts(module_timeout))
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=2)
+
+    try:
+        port_flags(ports, naabu_allow_full)
     except ValueError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=2)
@@ -495,6 +610,11 @@ def main(
         crtsh=crtsh, crtsh_timeout=crtsh_timeout, crtsh_retries=crtsh_retries,
         amass=amass, gau=gau, gau_threads=gau_threads, waybackurls=waybackurls,
         archive_dedupe=archive_dedupe, archive_k=archive_k, timeouts=timeouts,
+        katana_store=katana_store, jsluice=jsluice, secrets=secrets,
+        takeover=takeover, takeover_rate=takeover_rate, takeover_concurrency=takeover_concurrency,
+        naabu=naabu, naabu_rate=naabu_rate, ports=ports, naabu_allow_full=naabu_allow_full,
+        httpx_ports=httpx_ports, httpx_ports_rate=httpx_ports_rate,
+        arjun=arjun, arjun_max=arjun_max, arjun_rate=arjun_rate, arjun_threads=arjun_threads, arjun_stable=arjun_stable,
         skip_subfinder=skip_subfinder, skip_dnsx=skip_dnsx, skip_urlfinder=skip_urlfinder,
         skip_httpx=skip_httpx, skip_katana=skip_katana,
     )
@@ -507,6 +627,13 @@ def main(
     archives = [name for name, on in (("urlfinder", not skip_urlfinder), ("gau", gau), ("waybackurls", waybackurls)) if on]
     scan_bits.append(f"sous-domaines {'+'.join(sources) or 'aucune source'}")
     scan_bits.append(f"archives {'+'.join(archives) or 'aucune'}")
+    surface_bits = [
+        name for name, on in (
+            ("jsluice", jsluice and katana_store), ("secrets", secrets and katana_store), ("takeover", takeover),
+            (f"naabu {ports}", naabu), ("httpx ports", naabu and httpx_ports), (f"arjun ≤{arjun_max}", arjun),
+        ) if on
+    ]
+    scan_bits.append(f"surface {'+'.join(surface_bits) or 'aucune'}")
     if scope_enabled:
         scan_bits.append(f"scope {','.join(scope_apexes)}")
         if scope_excludes:
@@ -544,6 +671,7 @@ def main(
         "live_codes": sorted(live_code_set),
         "match_codes": match_codes,
         "modules": [m.name for m in modules if m.enabled],
+        "surface": {"ports": ports, "katana_store": katana_store, "arjun_max": arjun_max},
         "archive": {"dedupe": archive_dedupe, "k": archive_k},
         "timeouts": {name: seconds for name, seconds in sorted(timeouts.items())},
         "nuclei": {
@@ -573,6 +701,18 @@ def main(
         console.print(f"  🟢 [dim]liste live[/dim]       [bold]{live_files[0]}[/bold] [dim](katana/nuclei)[/dim]")
     if paths["tree_html"].exists():
         console.print(f"  🌳 [dim]arbre HTML[/dim]       [bold]{paths['tree_html']}[/bold]")
+    # Livrables de la phase 4b : seulement ceux que CE run a produits et qui ont du contenu.
+    extras = [
+        ("secrets", "secrets", "🔑", "secrets (masqués)", "secrets_txt"),
+        ("takeover", "takeover", "🏴", "takeover", "takeover_txt"),
+        ("takeover", "takeover", "📋", "candidats takeover", "takeover_candidates"),
+        ("naabu", "naabu", "🚪", "ports ouverts", "ports"),
+        ("httpx_ports", "httpx_ports", "🔭", "services hors 80/443", "urls_live_ports"),
+        ("arjun", "arjun", "🎯", "paramètres cachés", "arjun_params"),
+    ]
+    for _, module, icon, label, key in extras:
+        if produced(ctx, module) and paths[key].exists() and count_lines(paths[key]):
+            console.print(f"  {icon} [dim]{label:<20}[/dim] [bold]{paths[key]}[/bold] [dim]({count_lines(paths[key])})[/dim]")
 
     if scope_filter.total_rejected:
         by_stage = ", ".join(f"{stage} {n}" for stage, n in scope_filter.rejected.items() if n)

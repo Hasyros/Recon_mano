@@ -127,15 +127,20 @@ def merge_folder(folder: Path, log: Log = console.print) -> MergeResult:
 
     # 2. Listes finales : union des lignes httpx #1 (URLs de la carte) et #2 (nouvelles
     #    lignes seulement, depuis que httpx #2 ne reteste pas ce qu'httpx #1 a validé).
-    first, second = paths["httpx_jsonl"], paths["httpx2_jsonl"]
-    if not (first.exists() or second.exists()):
+    #    Les services web hors 80/443 (13_httpx_ports.jsonl, naabu → httpx_ports) y sont repris tels quels.
+    first, second, ports = paths["httpx_jsonl"], paths["httpx2_jsonl"], paths["httpx_ports_jsonl"]
+    if not (first.exists() or second.exists() or ports.exists()):
         notes.append("aucun JSONL httpx — listes *_final non reconstruites")
     else:
-        if second.exists():
+        if second.exists() or ports.exists():
+            if not second.exists():
+                notes.append(f"{second.name} absent — listes *_final reconstruites depuis {first.name}")
             rows = union_rows(
                 iter_httpx_rows(read_lines(first)), iter_httpx_rows(read_lines(second)),
-                only=set(read_lines(paths["all_urls"])),
+                only=set(read_lines(paths["all_urls"])) if second.exists() else None,
             )
+            if ports.exists():
+                rows = union_rows(rows, iter_httpx_rows(read_lines(ports)))
             split_httpx_rows(
                 rows, paths["urls_all_final"], paths["urls_200_final"], paths["urls_live_final"], live_codes
             )

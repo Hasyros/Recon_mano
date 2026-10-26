@@ -39,6 +39,12 @@ from .ui import console, human_duration
 # module réseau attend qu'un autre libère du budget plutôt que de démarrer étranglé.
 MIN_START_RATE = 10
 
+# Modules simultanés par défaut. Le DAG compte jusqu'à ~7 modules actifs en même temps
+# (chaîne d'archives, katana, nuclei, naabu → httpx_ports, takeover, jsluice/secrets locaux) ;
+# la plupart n'envoient rien à la cible ou attendent le budget de débit, qui plafonne le
+# trafic quel que soit le nombre de workers.
+DEFAULT_WORKERS = 6
+
 # Fichiers produits par le pipeline (clé interne → nom, à la racine du dossier de sortie
 # pour la compatibilité). Sert aussi au nettoyage (--clean) et à `merge`.
 ARTIFACTS: Dict[str, str] = {
@@ -56,6 +62,24 @@ ARTIFACTS: Dict[str, str] = {
     "urls_200": "urls_200.txt",
     "urls_live": "urls_live.txt",
     "katana": "06_katana.txt",
+    "jsluice": "09_jsluice_urls.txt",
+    "jsluice_secrets": "09_jsluice_secrets.jsonl",
+    "secrets_jsonl": "10_secrets.jsonl",
+    "secrets_txt": "10_secrets.txt",
+    "dnsx_cname": "11_dnsx_cname.jsonl",
+    "takeover_candidates": "11_takeover_candidates.txt",
+    "takeover_jsonl": "11_takeover.jsonl",
+    "takeover_txt": "11_takeover.txt",
+    "naabu_jsonl": "12_naabu.jsonl",
+    "ports": "12_ports.txt",
+    "httpx_ports_input": "13_httpx_ports_input.txt",
+    "httpx_ports_jsonl": "13_httpx_ports.jsonl",
+    "urls_live_ports": "urls_live_ports.txt",
+    "nuclei_ports_input": "07_nuclei_ports_input.txt",
+    "nuclei_ports_jsonl": "nuclei_ports.jsonl",
+    "arjun_input": "14_arjun_input.txt",
+    "arjun_json": "14_arjun.json",
+    "arjun_params": "14_arjun_params.txt",
     "all_urls": "all_urls.txt",
     "httpx2_input": "08_httpx2_input.txt",
     "httpx2_jsonl": "08_httpx2.jsonl",
@@ -78,8 +102,17 @@ ARTIFACTS: Dict[str, str] = {
 }
 
 
+# Dossiers produits (nettoyés par --clean) : réponses stockées par katana, JS extraits pour jsluice.
+ARTIFACT_DIRS: Dict[str, str] = {
+    "responses": "responses",
+}
+
+
 def build_paths(output: Path) -> Dict[str, Path]:
-    return {key: output / name for key, name in ARTIFACTS.items()}
+    paths = {key: output / name for key, name in ARTIFACTS.items()}
+    paths["responses_dir"] = output / ARTIFACT_DIRS["responses"] / "katana"
+    paths["responses_js"] = output / ARTIFACT_DIRS["responses"] / "js"
+    return paths
 
 
 class Status(str, Enum):
@@ -116,6 +149,7 @@ class Module:
     deps: List[str]
     run: Callable[["Context"], ModuleResult]
     binaries: List[str] = field(default_factory=list)
+    binaries_any: List[str] = field(default_factory=list)   # au moins un de ces binaires doit exister
     enabled: bool = True
     timeout: Optional[int] = None  # secondes ; None = illimité
     network: bool = False          # envoie du trafic à la cible → consomme le budget de débit
@@ -294,7 +328,7 @@ class Scheduler:
         self,
         modules: List[Module],
         ctx: Context,
-        max_workers: int = 4,
+        max_workers: int = DEFAULT_WORKERS,
         max_rps: int = 150,
         live: bool = True,
         verbose: bool = False,
@@ -493,6 +527,13 @@ class Scheduler:
             missing = [b for b in module.binaries if not self._find_binary(b)]
             if missing:
                 self._finish_instant(rec, Status.DISABLED, f"binaire {', '.join(missing)} introuvable — module désactivé")
+                progressed = True
+                continue
+            if module.binaries_any and not any(self._find_binary(b) for b in module.binaries_any):
+                self._finish_instant(
+                    rec, Status.DISABLED,
+                    f"aucun de {', '.join(module.binaries_any)} trouvé — module désactivé",
+                )
                 progressed = True
                 continue
             if len(futures) >= self.max_workers:

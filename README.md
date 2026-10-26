@@ -2,9 +2,10 @@
 
 Pipeline Python de découverte et reconnaissance de sous-domaines, orchestrant
 `subfinder`, `crt.sh` (module Python), `amass` (passif), `dnsx`, `urlfinder`, `gau`,
-`waybackurls`, `httpx`, `katana` et (en option, jamais par défaut) `nuclei` en deux
-passes. **Tout est actif par défaut** (mode « full ») et chaque module se coupe
-individuellement ; seul nuclei est opt-in (`-n`).
+`waybackurls`, `httpx`, `katana`, `jsluice`, `trufflehog`/`gitleaks`, `subzy`, `naabu`,
+`arjun` et (en option, jamais par défaut) `nuclei` en deux passes. **Tout est actif par
+défaut** (mode « full ») et chaque module se coupe individuellement ; seul nuclei (passes 1
+et 2, et son pendant sur les ports) est opt-in (`-n`).
 
 > À n'utiliser que sur des cibles pour lesquelles tu disposes d'une autorisation
 > explicite : programme de bug bounty dans son périmètre, mission de pentest, ou
@@ -25,6 +26,13 @@ cible ─┬─ subfinder (-all) ─┐
                                                      │
                                                [--nuclei] (opt-in)
                               (passe 1 par hôte ‖ katana · passe 2 par URL en fin de run)
+
+phase 4b, branches ajoutées :
+  katana ─ réponses stockées ─┬─ jsluice (endpoints → carte, secrets)      aucune requête
+                              └─ secrets (trufflehog sans vérification)    aucune requête
+  dnsx ─┬─ takeover (CNAME hors périmètre → subzy)
+        └─ naabu ─ httpx ports (hors 80/443) ─ listes finales · nuclei ports (opt-in)
+  httpx #2 ─ arjun (≤ 30 URLs représentatives) ─ run DAST de nuclei #2 (opt-in)
 ```
 
 Les étapes s'exécutent en parallèle quand leurs dépendances le permettent (voir
@@ -68,10 +76,16 @@ replis). Deux modules sans lien de dépendance tournent en même temps :
 
 ```
 subfinder ─┐
-crtsh ─────┼─ subdomains ── dnsx ──┐          ┌─ katana ────────┐
-amass ─────┘                       ├─ httpx ──┤                 ├─ merge_map ── httpx #2 ─┬─ tree
-urlfinder ─────────────────────────┘          └─ nuclei #1      │                         └─ nuclei #2
-   └─ gau ── waybackurls ───────────────────────  (opt-in, ‖ katana) ──┘                      (opt-in)
+crtsh ─────┼─ subdomains ── dnsx ─┬─ takeover
+amass ─────┘                      ├─ naabu ── httpx ports ─┬─ nuclei ports (opt-in)
+urlfinder ──────────────────┐     │                        │
+   └─ gau ── waybackurls ─┐ └─────┴─ httpx ─┬─ katana ─┬─ jsluice ─┬─ secrets
+                          │                 └─ nuclei #1        │
+                          │                    (opt-in, ‖ katana)
+                          └──────────────── merge_map ◄── (katana, jsluice, archives)
+                                               │
+              httpx #2 (attend aussi httpx ports) ─┬─ tree
+                                                   └─ arjun ── nuclei #2 (opt-in)
 ```
 
 | Module | Dépend de | Binaire | Option | Timeout / débit par défaut | Rôle |
@@ -86,11 +100,18 @@ urlfinder ───────────────────────�
 | `waybackurls` | gau | waybackurls (optionnel) | `--no-waybackurls`, `--waybackurls-timeout` | **15 min** | URLs de la Wayback Machine |
 | `httpx` | dnsx, urlfinder | httpx | `--skip-httpx` | 150 req/s | Fusion des hôtes et des URLs urlfinder, une passe |
 | `nuclei1` | httpx | nuclei | `-n` | 50 req/s | Opt-in : nuclei **par hôte**, pendant le crawl katana (voir [nuclei en deux passes](#nuclei-en-deux-passes)) |
-| `katana` | httpx | katana | `--skip-katana` | 150 req/s | Crawl des seeds vivantes |
-| `merge_map` | katana, gau, waybackurls | — | `--no-archive-dedupe`, `--archive-k` | — | `all_urls.txt` = seeds vivantes + crawl + archives réduites, périmètre strict (léger, sans réseau) |
-| `httpx2` | merge_map | httpx | `--no-revalidate` | 150 req/s | Validation des URLs de la carte **absentes d'httpx #1** |
+| `katana` | httpx | katana | `--skip-katana`, `--no-katana-store` | 150 req/s | Crawl des seeds vivantes ; **stocke les réponses** dans `responses/katana` (`-store-response`) |
+| `takeover` | dnsx | dnsx · subzy (optionnel) | `--no-takeover`, `--takeover-timeout`, `--takeover-rate`, `--takeover-concurrency` | **10 req/s** · **15 min** · concurrence 5 | `dnsx -cname` ; subzy sur les seuls hôtes dont un CNAME sort du périmètre (voir [takeover](#takeover)) |
+| `naabu` | dnsx | naabu (optionnel) | `--no-naabu`, `--ports`, `--naabu-allow-full`, `--naabu-timeout`, `--naabu-rate` | **100 sondes/s** · **30 min** · `top-1000` | Ports ouverts des hôtes vivants, `-exclude-cdn` (voir [ports](#ports-naabu--httpx-ports--nuclei-ports)) |
+| `httpx_ports` | naabu | httpx | `--no-httpx-ports`, `--httpx-ports-rate` | **50 req/s** · **15 min** | httpx sur les `hôte:port` hors 80/443 ; ces services rejoignent les listes finales |
+| `nuclei_ports` | httpx_ports | nuclei | `-n` (suit `--nuclei-passes`) | `--nuclei-rate-limit` (50 req/s) · **30 min** | Opt-in : réglages de la passe 1 sur les services hors 80/443 |
+| `jsluice` | katana | jsluice (optionnel) | `--no-jsluice`, `--jsluice-timeout` | aucune requête · **10 min** | Endpoints (→ carte, validés par httpx #2) et secrets des JS stockés par katana |
+| `secrets` | katana, jsluice | trufflehog **ou** gitleaks (optionnel) | `--no-secrets`, `--secrets-timeout` | aucune requête · **10 min** | Secrets des réponses stockées, **sans vérification** → `10_secrets.txt` (masqué) |
+| `merge_map` | katana, gau, waybackurls, jsluice | — | `--no-archive-dedupe`, `--archive-k` | — | `all_urls.txt` = seeds vivantes + crawl + archives et endpoints JS réduits, périmètre strict (léger, sans réseau) |
+| `httpx2` | merge_map, httpx_ports | httpx | `--no-revalidate` | 150 req/s | Validation des URLs de la carte **absentes d'httpx #1** ; reprend les services hors 80/443 dans les listes finales |
 | `tree` | httpx2 | — | `--no-tree` | — | `urls_tree.html` |
-| `nuclei2` | httpx2 | nuclei | `-n` | 150 req/s | Opt-in : nuclei **par URL représentative** (DAST + exposition), fin de pipeline |
+| `arjun` | httpx2 | arjun (optionnel) | `--no-arjun`, `--arjun-max`, `--arjun-timeout`, `--arjun-rate`, `--arjun-threads`, `--arjun-stable` | **20 req/s** · **30 min** · ≤ **30** URLs | Paramètres cachés des URLs représentatives → `14_arjun_params.txt` (voir [arjun](#arjun)) |
+| `nuclei2` | httpx2, arjun | nuclei | `-n` | 150 req/s | Opt-in : nuclei **par URL représentative** (DAST + exposition, + URLs d'arjun), fin de pipeline |
 
 Les valeurs par défaut (module actif ou non, débit, timeout, paramètres) vivent dans
 une seule table, `recon_mano/config.py` (`MODULE_DEFAULTS`) ; les options de la CLI les
@@ -100,26 +121,36 @@ sur les options dédiées (`--amass-timeout`…). `PRESETS` contient pour l'inst
 preset `full` (tous les modules) ; les presets rapides viendront plus tard, il n'y a pas
 encore d'option `--mode`.
 
-- **`--workers N`** (défaut 4) : nombre maximum de modules simultanés.
+- **`--workers N`** (défaut **6**, était 4) : nombre maximum de modules simultanés. Le DAG de la
+  phase 4b peut en avoir ~7 d'actifs (chaîne d'archives, katana, nuclei #1, naabu, takeover,
+  httpx ports, jsluice/secrets) ; à 4, des modules légers ou en attente d'un service public
+  (archives, amass : jusqu'à 15 min) en bloqueraient d'autres, plus utiles. Monter les workers
+  n'augmente pas le trafic vers la cible : celui-ci est plafonné par `--max-rps`.
   **`--sequential`** = `--workers 1` (un seul module à la fois, ordre historique) —
   pratique pour déboguer ou comparer.
 - **`--max-rps N`** (défaut 150) : budget de débit **global**. `--rate-limit`,
   `--nuclei-rate-limit` et `--nuclei2-rate-limit` ne sont plus que des débits
   *demandés* ; la somme des débits accordés aux modules qui frappent la cible
-  (httpx, katana, httpx #2, nuclei #1, nuclei #2) ne dépasse
-  jamais `--max-rps`. Le budget est global parce que c'est la cible qui encaisse
+  (httpx, katana, takeover, naabu, httpx ports, httpx #2, arjun, nuclei #1/ports/#2) ne dépasse
+  jamais `--max-rps`. Dans l'ordre des modules, `nuclei1` puis `katana` sont servis avant `takeover`
+  et `naabu` : à budget égal le crawl garde la priorité et ces deux-là prennent le reste ou
+  attendent (sans `-n`, katana à 150 req/s sur `--max-rps 150` fait attendre naabu jusqu'à la fin
+  du crawl ; baisser `--rate-limit` ou monter `--max-rps` les fait avancer ensemble). Le budget est global parce que c'est la cible qui encaisse
   le trafic cumulé, pas chaque outil : deux modules à 150 req/s en parallèle font
   300 req/s côté serveur, ce qui déclenche WAF et bans. Un module reçoit
   `min(demandé, budget restant)` au démarrage ; s'il reste moins de
   `min(demandé, 10)`, il attend qu'un autre module libère du budget. Les modules
   qui n'attaquent pas la cible (subfinder, crtsh, amass, subdomains, dnsx, urlfinder, gau,
-  waybackurls, merge_map, tree) n'en consomment pas : crt.sh et les archives sont des
+  waybackurls, jsluice, secrets, merge_map, tree) n'en consomment pas : crt.sh et les archives sont des
   services publics, pas la cible. Pour dépasser 150 req/s, relever `--max-rps` en même temps que
   `--rate-limit`.
 - **Binaire manquant** : le module est `désactivé` (« binaire X introuvable »), le
   reste du pipeline continue avec ses replis (ex. sans dnsx, httpx part de la
-  liste `01_subdomains.txt`). amass, gau et waybackurls sont **optionnels** : sans eux
-  les autres sources font le travail. **Exception dans un module** : `échec`, message
+  liste `01_subdomains.txt`). amass, gau, waybackurls, jsluice, naabu, arjun, trufflehog et
+  gitleaks sont **optionnels** : sans eux les autres sources font le travail. `secrets` est
+  désactivé seulement si ni trufflehog ni gitleaks n'existent (trufflehog d'abord, sinon
+  gitleaks). **Exception : `takeover`** n'est pas désactivé sans subzy — il écrit quand même
+  `11_takeover_candidates.txt` (utile en soi) et se termine avec une note ; seul dnsx est requis. **Exception dans un module** : `échec`, message
   dans le récapitulatif (traceback complet avec `-v`), les modules indépendants finissent
   (crt.sh injoignable ne bloque rien).
   Si **aucune** source (subfinder, crtsh, amass, `--subdomains`) ne rend d'hôte en
@@ -181,18 +212,32 @@ sous l'étape `merge`.
 | `urls_live.txt` | URLs nues dont le code est dans `--live-codes` — **seeds de katana** |
 | `06_katana.txt` | Crawl actif (URLs découvertes, sans code HTTP) |
 | `all_urls.txt` | Carte (seeds + crawl + archives réduites, périmètre strict) |
+| `responses/katana/` | **Réponses brutes** stockées par katana (`index.txt` + un fichier par réponse, voir [Réponses stockées](#réponses-stockées-par-katana)) — lues par jsluice et secrets, supprimées par `--clean` |
+| `09_jsluice_urls.txt` | Endpoints extraits du JS, résolus, en périmètre, statiques exclues — **non validés** (entrent dans la carte, httpx #2 les teste) |
+| `09_jsluice_secrets.jsonl` | Sortie brute de `jsluice secrets` — **secrets en clair, fichier sensible** |
+| `10_secrets.jsonl` | Sorties brutes de trufflehog / gitleaks / jsluice — **secrets en clair, fichier sensible : ne pas partager ni versionner** |
+| **`10_secrets.txt`** | **Résumé lisible et masqué** : `[détecteur] URL d'origine (outil, fichier:ligne) 4 premiers caractères…` |
+| `11_dnsx_cname.jsonl` | `dnsx -cname -resp -json` sur les hôtes vivants |
+| `11_takeover_candidates.txt` | Hôtes dont un CNAME sort du périmètre (écrit même sans subzy) |
+| **`11_takeover.jsonl`** / `11_takeover.txt` | Résultats subzy **vulnérables seulement** (brut / lisible) |
+| `12_naabu.jsonl` / **`12_ports.txt`** | Ports ouverts (sortie naabu / `hôte:port`), en périmètre |
+| `13_httpx_ports_input.txt` / `13_httpx_ports.jsonl` | `hôte:port` hors 80/443 envoyés à httpx / sortie brute |
+| **`urls_live_ports.txt`** | Services web hors 80/443 vivants — **entrée de nuclei ports** ; ils sont aussi dans `urls_*_final.txt` et l'arbre |
+| `07_nuclei_ports_input.txt` / `nuclei_ports.jsonl` | `-n` seulement : racines `scheme://hôte:port` envoyées à nuclei / findings bruts |
+| `14_arjun_input.txt` / `14_arjun.json` | URLs confiées à arjun (≤ `--arjun-max`) / sortie brute (`{url: {params, method, headers}}`) |
+| **`14_arjun_params.txt`** | Une URL par jeu de paramètres découvert (`https://h/p?a=1&b=1`, existants conservés), en périmètre |
 | `08_httpx2_input.txt` | Ce qui a réellement été envoyé à httpx #2 : URLs de la carte absentes d'`05_httpx.jsonl` |
 | `08_httpx2.jsonl` | httpx #2 brut — **uniquement les nouvelles lignes** (les seeds d'httpx #1 ne sont pas re-testées) |
 | **`urls_all_final.txt`** | **Triage manuel** — surface vivante complète, annotée (seeds + katana + gau + waybackurls), union des lignes httpx #1 et #2 |
 | **`urls_200_final.txt`** | **Tous les endpoints 200** (toutes sources, validés) |
-| `urls_live_final.txt` | Liste live après httpx #2 (404, 5xx et timeouts écartés) — **source de la passe 2 de nuclei** (la passe 1 part de `urls_live.txt`) |
+| `urls_live_final.txt` | Liste live après httpx #2 (404, 5xx et timeouts écartés) — **source de la passe 2 de nuclei et d'arjun** (la passe 1 part de `urls_live.txt`) |
 | `rejected_scope.tsv` | Entrées écartées par le filtre de périmètre (`étape<TAB>hôte<TAB>ligne`), remis à zéro à chaque run |
 | `07_nuclei1_input.txt` | Passe 1 : hôtes (`scheme://hôte[:port]`) envoyés à nuclei (+ `07_nuclei1_input_normal.txt` / `_waf.txt` si des hôtes sont derrière un WAF/CDN) |
 | `07_nuclei2_input.txt` | Passe 2 : URLs représentantes (K par signature, statiques exclues) |
 | `07_nuclei2_params.txt` | Passe 2 : représentantes avec paramètres → run DAST |
 | `07_nuclei2_priority.txt` | Passe 2 : représentantes prioritaires → run exposition |
 | `nuclei_pass1.jsonl` / `nuclei_pass2.jsonl` | Findings bruts de chaque passe (JSONL, une ligne = un finding) — source de vérité |
-| `nuclei.txt` | Vue lisible fusionnée des deux passes : `[sévérité] template-id URL`, triée du plus grave au moins grave |
+| `nuclei.txt` | Vue lisible fusionnée des deux passes **et de nuclei ports** : `[sévérité] template-id URL`, triée du plus grave au moins grave |
 | **`urls_tree.html`** | **Arbre interactif repliable des 200** (à ouvrir au navigateur) |
 | `run_config.json` | Config du run (cible, périmètre, codes, modules) — relue par `recon_mano merge` |
 | `run_stats.json` | Statut, durées et débit par module ; `wall_clock`, `sum_of_durations`, `parallel_gain` |
@@ -227,6 +272,12 @@ go install github.com/lc/gau/v2/cmd/gau@latest                        # optionne
 go install github.com/tomnomnom/waybackurls@latest                    # optionnel (module waybackurls)
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest   # optionnel
 go install github.com/tomnomnom/gf@latest                              # optionnel (passe 2 de nuclei)
+go install github.com/BishopFox/jsluice/cmd/jsluice@latest            # optionnel (module jsluice)
+go install github.com/PentestPad/subzy@latest                         # optionnel (module takeover)
+go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest  # optionnel (naabu, httpx ports, nuclei ports)
+go install github.com/trufflesecurity/trufflehog/v3@latest            # optionnel (module secrets, de préférence)
+go install github.com/gitleaks/gitleaks/v8@latest                     # optionnel (module secrets, repli)
+python -m pip install arjun                                           # optionnel (module arjun)
 ```
 
 > **Piège `httpx`.** Le client HTTP Python s'installe aussi sous le nom `httpx`
@@ -292,7 +343,7 @@ Options utiles :
 |---|---|
 | `--clean` | Supprime les anciens fichiers de sortie avant de lancer |
 | `-v`, `--verbose` | Affiche les commandes exactes et le flux des outils en direct (sans board live) |
-| `--check` | Vérifie la présence des outils puis quitte (requis : subfinder, dnsx, httpx, urlfinder, katana ; optionnels : amass, gau, waybackurls, nuclei, gf — crt.sh n'a besoin d'aucun binaire) |
+| `--check` | Vérifie la présence des outils puis quitte (requis : subfinder, dnsx, httpx, urlfinder, katana ; optionnels : amass, gau, waybackurls, jsluice, trufflehog, gitleaks, subzy, naabu, arjun, nuclei, gf — crt.sh n'a besoin d'aucun binaire) |
 | `--all-sources` / `--no-all-sources` | `subfinder -all` : **défaut on** (toutes les sources, plus lent mais plus complet) ; `--no-all-sources` pour le mode rapide |
 | `--subdomains` | Sous-domaines déjà connus (fichier ou liste virgulée, ex: trouvés via `ffuf`) : **remplace subfinder** ; crt.sh et amass s'y ajoutent sauf `--no-crtsh` / `--no-amass` (voir [Sources de sous-domaines](#sources-de-sous-domaines)) |
 | `--crtsh` / `--no-crtsh` | Sous-domaines depuis crt.sh (défaut on, sans binaire) |
@@ -302,6 +353,13 @@ Options utiles :
 | `--gau` / `--no-gau`, `--gau-timeout`, `--gau-threads` | URLs d'archives via gau (défaut on) · durée max en minutes (défaut **15**) · `--threads` (défaut 2) |
 | `--waybackurls` / `--no-waybackurls`, `--waybackurls-timeout` | URLs de la Wayback Machine (défaut on) · durée max en minutes (défaut **15**) |
 | `--archive-dedupe` / `--no-archive-dedupe`, `--archive-k` | Réduit les URLs gau/waybackurls à K par signature avant httpx #2 (défaut on, K=3) — voir [Archives](#archives-urlfinder--gau--waybackurls) |
+| `--katana-store` / `--no-katana-store` | `katana -store-response` : réponses brutes dans `<sortie>/responses/katana` (défaut **on** ; jsluice et secrets en dépendent et sont ignorés sans) — voir [Réponses stockées](#réponses-stockées-par-katana) |
+| `--jsluice` / `--no-jsluice`, `--jsluice-timeout` | Endpoints et secrets des JS stockés (défaut on) · durée max en minutes (défaut **10**) |
+| `--secrets` / `--no-secrets`, `--secrets-timeout` | Recherche de secrets, **jamais de vérification** (défaut on) · durée max en minutes (défaut **10**) |
+| `--takeover` / `--no-takeover`, `--takeover-timeout`, `--takeover-rate`, `--takeover-concurrency` | CNAME hors périmètre + subzy (défaut on) · durée max en minutes (défaut **15**) · débit demandé (**10**) · `--concurrency` de subzy (défaut **5**, jamais au-dessus du débit accordé) |
+| `--naabu` / `--no-naabu`, `--ports`, `--naabu-allow-full`, `--naabu-timeout`, `--naabu-rate` | Scan de ports (défaut on) · `top-100` \| `top-1000` (défaut) \| liste `80,443,8080-8090` ; `full` et les listes de plus de 5000 ports sont **refusés** sauf `--naabu-allow-full` · durée max en minutes (défaut **30**) · débit demandé en sondes/s (défaut **100**) |
+| `--httpx-ports` / `--no-httpx-ports`, `--httpx-ports-rate` | httpx sur les services hors 80/443 (défaut on) · débit demandé (**50**) |
+| `--arjun` / `--no-arjun`, `--arjun-max`, `--arjun-timeout`, `--arjun-rate`, `--arjun-threads`, `--arjun-stable` | arjun (défaut on) · URLs max (défaut **30**) · durée max en minutes (défaut **30**) · `--rate-limit` demandé (**20**) · `-t` (défaut **2**) · `--stable` (défaut **off**, voir [arjun](#arjun)) |
 | `--module-timeout nom=minutes` | Timeout d'un module quelconque (répétable, `0` = illimité) ; prioritaire sur les options dédiées |
 | `--no-wildcard-filter` | Désactive `dnsx -wd` |
 | `--match-codes` | Codes retenus par httpx (défaut : large, 401/403/500 compris) — pilote les fichiers de triage |
@@ -315,8 +373,8 @@ Options utiles :
 | `--urlfinder-retries` | Réessais si urlfinder rend 0 (défaut 1) |
 | `--urlfinder-retry-wait` | Base du délai entre essais urlfinder, en s, progressif ×n (défaut 30) |
 | `--rate-limit` | Requêtes/seconde demandées par httpx et katana (défaut 150), plafonnées par `--max-rps` |
-| `--max-rps` | Budget de débit **global** en req/s partagé par httpx, katana et nuclei #1/#2 (défaut 150) — voir [Exécution parallèle](#exécution-parallèle) |
-| `--workers` | Modules exécutés en parallèle au maximum (défaut 4) |
+| `--max-rps` | Budget de débit **global** en req/s partagé par httpx, katana, takeover, naabu, httpx ports, arjun et nuclei (défaut 150) — voir [Exécution parallèle](#exécution-parallèle) |
+| `--workers` | Modules exécutés en parallèle au maximum (défaut **6**) |
 | `--sequential` | Un module à la fois (= `--workers 1`), pour déboguer ou comparer |
 | `--revalidate` / `--no-revalidate` | Passe httpx #2 sur les URLs inédites de la carte (katana, gau, waybackurls) → `urls_200_final.txt` (tous les 200). Défaut on |
 | `--tree` / `--no-tree` | Génère `urls_tree.html` (arbre interactif des 200). Défaut on |
@@ -366,7 +424,7 @@ relancer aucun outil, avec la sous-commande `merge` (détails dans
 recon_mano merge sortie
 ```
 
-`nuclei` est désactivé par défaut : c'est la seule étape qui envoie des
+`nuclei` (et `nuclei ports`) sont désactivés par défaut : ce sont les seules étapes qui envoient des
 payloads, elle ne doit jamais partir sans geste explicite (`-n`). Sans `-n`,
 ni la passe 1 ni la passe 2 n'existent : le pipeline se comporte exactement comme
 sans nuclei (même commande httpx, katana garde tout le budget, aucun fichier nuclei).
@@ -442,6 +500,103 @@ vue lisible fusionnée (`[sévérité] template-id URL`, du plus grave au moins 
 dédoublonnée) et une ligne de synthèse donne le décompte par sévérité. Seules les
 passes terminées dans **ce** run alimentent `nuclei.txt` : un JSONL périmé d'un
 run précédent est ignoré.
+
+### Réponses stockées par katana
+
+katana tourne avec `-store-response -store-response-dir <sortie>/responses/katana` (désactivable :
+`--no-katana-store`, mais jsluice et secrets sont alors ignorés avec une note). Format (vérifié
+dans le code de katana) : un fichier par réponse, `responses/katana/<hôte, « : » remplacé par « _ »>/<sha1 de l'URL>.txt`,
+contenant l'URL, la requête brute puis la réponse brute (en-têtes et corps) ; `index.txt` liste une
+ligne `<chemin du fichier> <URL> (<statut>)` par réponse. Le dossier est vidé au début de chaque
+run de katana (l'index est écrit en ajout) et supprimé par `--clean` ; un dossier laissé par un
+run précédent n'est jamais relu.
+
+**Espace disque.** Chaque page et chaque JS crawlés sont gardés en entier : prévoir de quelques
+dizaines de Mo à plusieurs centaines de Mo (le plafond `--katana-max-pages`, 3000 pages par
+domaine, et la durée `--katana-duration` bornent le crawl). Le volume écrit est affiché dans la
+note de katana (« N réponses stockées (X Mo) »). Ces fichiers contiennent des en-têtes
+(`Set-Cookie`…) et des corps réels : les traiter comme sensibles.
+
+### jsluice
+
+Pour chaque réponse **2xx** en périmètre dont l'URL se termine en `.js`/`.mjs`/`.cjs` ou dont le
+content-type est javascript/ecmascript (jamais du HTML, même sous une URL en `.js`), le corps est
+extrait (`responses/js/`, supprimé ensuite ; au-delà de 5 Mo le fichier est ignoré) et passé à
+`jsluice urls` puis `jsluice secrets`. jsluice lit les chemins sur son entrée standard : aucune
+limite de longueur de commande. Il n'envoie **aucune requête**. Les endpoints relatifs
+(`/api/x`, `../y`, `//cdn…`) sont résolus avec `urljoin` contre l'URL du JS qui les contient ; seuls
+http(s) restent ; une expression dynamique (`EXPR`) dans l'hôte ou le chemin écarte l'URL, dans la
+requête elle devient `1` ; les ressources statiques sont exclues, puis le périmètre est appliqué
+(étape `jsluice`). Résultat : `09_jsluice_urls.txt`. **Ces endpoints ne sont pas validés** : ils
+entrent dans la carte (`merge_map`, réduction `--archive-k` comme les archives), httpx #2 les
+teste, et seuls ceux qui répondent servent ensuite (nuclei #2, arjun, listes finales).
+`09_jsluice_secrets.jsonl` est la sortie brute de `jsluice secrets`.
+
+### secrets
+
+trufflehog si installé, sinon gitleaks, sur tout `responses/katana` ; les secrets de
+`jsluice secrets` sont fusionnés au résumé.
+
+- trufflehog : `trufflehog filesystem <dossier> --no-verification --json --no-update --no-color`.
+  **`--no-verification` est toujours passé** et `--only-verified` / `--results=verified` ne le
+  sont jamais : vérifier un secret, c'est l'essayer chez son fournisseur, donc utiliser un
+  identifiant tiers trouvé — hors périmètre.
+- gitleaks : `gitleaks dir <dossier> --report-format json --report-path … --exit-code 0` (v8.19+) ;
+  si cette commande échoue sans rapport, repli sur l'ancien `gitleaks detect --no-git --source`.
+- Une découverte dont l'URL d'origine (index katana) est hors périmètre est écartée.
+
+`10_secrets.txt` = `[détecteur] URL d'origine (outil, fichier:ligne) début-du-secret…` (4 premiers
+caractères, moins pour un secret court) ; c'est tout ce que montrent la console et ce fichier.
+`10_secrets.jsonl` et `09_jsluice_secrets.jsonl` gardent les **secrets en clair** (la preuve) :
+fichiers sensibles, à ne pas partager ni versionner.
+
+### takeover
+
+1. `dnsx -l 02_dnsx.txt -cname -resp -json` (interroge les résolveurs, pas la cible) →
+   `11_dnsx_cname.jsonl`.
+2. **Candidats** = hôtes dont au moins un CNAME pointe **hors du périmètre** (service tiers :
+   Heroku, S3, GitHub Pages…). Un CNAME interne n'est pas un candidat ; un CNAME vers un hôte exclu
+   (`--exclude`) non plus. Liste : `11_takeover_candidates.txt`.
+3. `subzy run --targets … --concurrency 5 --timeout 10 --hide_fails --https --output …` sur ces
+   seuls candidats (subzy récupère les hôtes : le module consomme le budget de débit ; la
+   concurrence ne dépasse jamais le débit accordé). Jamais `--verify_ssl`. Seuls les résultats
+   **vulnérables** sont gardés (`11_takeover.jsonl`, `11_takeover.txt`).
+
+Sans subzy, le module se termine quand même avec la liste de candidats. Avec `-n`, la passe 1 de
+nuclei couvre déjà le tag `takeover` ; subzy tourne malgré tout (empreintes différentes).
+
+### Ports (naabu → httpx ports → nuclei ports)
+
+- **naabu** scanne les seuls hôtes vivants (`02_dnsx.txt`) : `naabu -list … -top-ports 1000 -rate <accordé>
+  -retries 1 -exclude-cdn -json`. `-exclude-cdn` limite les hôtes derrière un CDN/WAF à 80/443.
+  Le type de scan est laissé à naabu (CONNECT sans root, SYN avec). `--ports` : `top-100`,
+  `top-1000` (défaut) ou une liste ; `full` est refusé sauf `--naabu-allow-full`. Un timeout de
+  module garde les ports déjà trouvés. Sorties filtrées au périmètre : `12_naabu.jsonl`, `12_ports.txt`.
+- **httpx ports** teste les `hôte:port` **hors 80/443** (déjà vus par httpx #1) → `13_httpx_ports.jsonl`
+  et `urls_live_ports.txt` (codes `--live-codes`, périmètre). **Ces services rejoignent les listes
+  finales** : httpx #2 (qui attend donc httpx ports) reprend leurs lignes dans `urls_all_final.txt`,
+  `urls_200_final.txt`, `urls_live_final.txt` et l'arbre HTML ; `recon_mano merge` les reprend aussi depuis
+  `13_httpx_ports.jsonl`. Ils n'entrent pas dans la carte `all_urls.txt` (ce n'est pas du crawl). Comme pour
+  les archives, si naabu est lent, httpx #2 attend au plus son timeout (`--naabu-timeout`).
+- **nuclei ports** (`-n` seulement, et seulement si la passe 1 est active : `--nuclei-passes`) :
+  racines `scheme://hôte:port` de `urls_live_ports.txt`, réglages de la passe 1 (`-as` selon
+  `--nuclei-mode`, `-etags fuzz,dos,intrusive`, jamais `-dast`) → `nuclei_ports.jsonl`, repris dans
+  `nuclei.txt` et le décompte par sévérité.
+
+### arjun
+
+Cherche des paramètres cachés, sur quelques URLs seulement car il envoie des centaines de requêtes
+par URL : `urls_live_final.txt` → une URL par signature (`signatures.representatives(k=1)`), statiques
+exclues, **prioritaires d'abord** (`admin`, `api`, `upload`…), plafonnées à `--arjun-max` (30).
+Commande : `arjun -i … -oJ 14_arjun.json -m GET -t 2 -T 15 --rate-limit <débit accordé>`.
+`14_arjun_params.txt` = une URL par jeu de paramètres trouvé, valeurs factices `=1`, paramètres déjà
+présents conservés, en périmètre.
+
+`--stable` d'arjun (1 thread **et 3 à 9 s de pause par requête**) est **désactivé par défaut** : avec
+des centaines de requêtes par URL il rendrait le module inutilisable ; la prudence vient du débit
+(`--rate-limit`, plafonné par `--max-rps`) et des 2 threads. `--arjun-stable` le réactive.
+Sans `-n`, arjun reste un livrable de surface ; avec `-n`, **nuclei #2 attend arjun** et ajoute
+`14_arjun_params.txt` à la liste de son run DAST, *après* la réduction par signature.
 
 ### Sources de sous-domaines
 

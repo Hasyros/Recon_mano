@@ -224,7 +224,7 @@ def test_each_new_module_can_be_turned_off(tmp_path, monkeypatch, module, tool):
         assert tool not in tools.calls
     else:
         assert fake.requests == []
-    others = [n for n in statuses(scheduler) if n not in (module, "nuclei1", "nuclei2")]
+    others = [n for n in statuses(scheduler) if n != module and not n.startswith("nuclei")]
     assert all(statuses(scheduler)[n] is Status.DONE for n in others), statuses(scheduler)
 
 
@@ -446,11 +446,15 @@ def test_archive_urls_are_validated_by_httpx2_and_dead_ones_dropped(tmp_path, mo
 # --------------------------------------------------------------------------- #
 
 
+PORT_URL = "https://www.example.com:8080"      # service hors 80/443 que le faux naabu « ouvre » sur www.example.com
+
+
 def legacy_finals(tmp_path, tools, map_urls):
-    """Ce que l'ancien httpx #2 (carte entière re-testée) aurait produit avec le même faux httpx."""
+    """Ce que l'ancien httpx #2 (carte entière re-testée) aurait produit avec le même faux httpx,
+    plus les services hors 80/443 (httpx ports) qui rejoignent les listes finales."""
     rows = [
         {"url": u, "status_code": tools.codes.get(u) or fake_status(u)}
-        for u in map_urls if u not in tools.unreachable
+        for u in list(map_urls) + [PORT_URL] if u not in tools.unreachable
     ]
     out = {k: tmp_path / f"legacy_{k}.txt" for k in ("all", "200", "live")}
     split_httpx_rows(rows, out["all"], out["200"], out["live"], LIVE_CODES)

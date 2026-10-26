@@ -62,7 +62,7 @@ def test_defaults_in_the_registry_match_the_built_modules():
 
 
 def test_nuclei_is_the_only_opt_in_module():
-    assert [n for n, d in MODULE_DEFAULTS.items() if not d.enabled] == ["nuclei1", "nuclei2"]
+    assert [n for n, d in MODULE_DEFAULTS.items() if not d.enabled] == ["nuclei1", "nuclei_ports", "nuclei2"]
     assert Options(target="x.com").nuclei is False
     assert all(m.enabled for m in build_modules(Options(target="x.com")) if not m.name.startswith("nuclei"))
 

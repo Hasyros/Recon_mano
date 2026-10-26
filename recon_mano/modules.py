@@ -3,10 +3,16 @@
 DAG (une flèche = « doit être terminé avant »)::
 
     subfinder ─┐
-    crtsh ─────┼─ subdomains ─ dnsx ─┐             ┌─ katana ─────────┐
-    amass ─────┘                      ├─ httpx ─────┤                  ├─ merge_map ─ httpx2 ─┬─ tree
-    urlfinder ────────────────────────┘             └─ nuclei1 (opt-in)│                     └─ nuclei2 (opt-in)
-       └─ gau ─ waybackurls ────────────────────────────────────────────┘
+    crtsh ─────┼─ subdomains ─ dnsx ─┬─ takeover
+    amass ─────┘                     ├─ naabu ─ httpx_ports ─┬─ nuclei_ports (opt-in)
+    urlfinder ───────────────────────┴─ httpx ─┬─ katana ─┬─ jsluice ─┬─ secrets    │
+       └─ gau ─ waybackurls ─────────────┐     └─ nuclei1 │           │             │
+                                         │       (opt-in) │           │             │
+                                         └─────────── merge_map ◄─────┘             │
+                                                          │                         │
+                                                       httpx2 ◄─────────────────────┘
+                                                          ├─ tree
+                                                          └─ arjun ─ nuclei2 (opt-in)
 
 Sous-domaines : subfinder (-all), crtsh (Python, crt.sh) et amass (passif) tournent en
 parallèle puis `subdomains` les fusionne (`01_subdomains.txt`, lu par dnsx). Archives :
@@ -17,6 +23,14 @@ par aucun httpx avant `merge_map`, qui les réduit puis les confie à httpx #2.
 nuclei1 (par hôte) démarre dès qu'httpx #1 a confirmé les hôtes vivants et tourne
 pendant le crawl katana ; nuclei2 (par URL représentative) clôt le pipeline.
 
+Phase 4b : katana stocke les réponses (`responses/katana`) ; jsluice y lit les JS (endpoints
+non validés → carte → httpx #2) et `secrets` les scanne (trufflehog sans vérification, sinon
+gitleaks) — ni l'un ni l'autre n'envoie de requête. `takeover` repère les CNAME hors périmètre
+(dnsx) puis passe subzy sur ces seuls hôtes. `naabu` scanne les ports des hôtes vivants,
+`httpx_ports` valide les services web hors 80/443 (ils rejoignent les listes finales via httpx #2)
+et `nuclei_ports` (opt-in) les scanne. `arjun` cherche des paramètres cachés sur quelques URLs
+représentatives et nourrit le run DAST de nuclei #2.
+
 Chaque fonction `run_*` reproduit l'étape historique de `main()` : mêmes fichiers,
 même filtrage de périmètre, mêmes replis. Ce qui change : elle lit l'état laissé
 par ses dépendances dans `ctx.state` (`hosts_file`, `httpx_live`…) au lieu de
@@ -25,12 +39,14 @@ variables locales, et journalise via `ctx.log` (imprimé d'un bloc en fin de mod
 
 from __future__ import annotations
 
+import json
 import math
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from . import crtsh as crtsh_client
@@ -40,7 +56,9 @@ from .io_utils import count_lines, read_lines, write_lines
 from .liveness import (
     DEFAULT_LIVE_CODES,
     clean_live_urls,
+    filter_live,
     iter_httpx_rows,
+    parse_codes,
     protected_hosts,
     seen_urls,
     split_httpx_output,
@@ -50,6 +68,7 @@ from .liveness import (
 from .pipeline import Context, Module, ModuleError, ModuleResult, ModuleSkipped, Status
 from .report import write_report as write_tree_report
 from .scope import ScopeFilter, host_of
+from . import surface
 from .ui import STAGE_ICONS, console, eta_line, human_duration, report
 
 # Large volontairement : 401/403 = endpoints protégés, 500 = crash. Les filtrer
@@ -78,7 +97,9 @@ Log = Callable[[Optional[str]], None]
 # Archives : gau et waybackurls interrogent les mêmes sources publiques qu'urlfinder.
 GAU_BLACKLIST = "png,jpg,jpeg,gif,svg,ico,webp,bmp,css,woff,woff2,ttf,eot,otf,mp3,mp4,webm"
 AMASS_SUBS_TIMEOUT = 120  # s : lecture des noms dans la base amass (rapide)
-ARCHIVE_MODULES = ("gau", "waybackurls")  # ordre de fusion dans la carte
+# Sources d'URLs NON validées, dans l'ordre de fusion dans la carte : archives publiques et endpoints
+# extraits du JS (jsluice). Toutes passent par httpx #2 avant d'alimenter quoi que ce soit.
+ARCHIVE_MODULES = ("gau", "waybackurls", "jsluice")
 
 
 @dataclass
@@ -97,6 +118,7 @@ class Options:
     katana_duration: str = "10m"
     katana_ignore_query: bool = False
     katana_filter_similar: bool = True
+    katana_store: bool = default_param("katana", "store")           # réponses stockées : requis par jsluice et secrets
     urlfinder_all: bool = True
     urlfinder_retries: int = 1
     urlfinder_retry_wait: int = 30
@@ -133,6 +155,27 @@ class Options:
     waybackurls: bool = MODULE_DEFAULTS["waybackurls"].enabled
     archive_dedupe: bool = default_param("merge_map", "archive_dedupe")
     archive_k: int = default_param("merge_map", "archive_k")
+    # Phase 4b (tout actif par défaut ; seul nuclei, dont nuclei_ports, reste opt-in).
+    jsluice: bool = MODULE_DEFAULTS["jsluice"].enabled
+    jsluice_concurrency: int = default_param("jsluice", "concurrency")
+    jsluice_max_bytes: int = default_param("jsluice", "max_bytes")
+    secrets: bool = MODULE_DEFAULTS["secrets"].enabled
+    takeover: bool = MODULE_DEFAULTS["takeover"].enabled
+    takeover_rate: int = MODULE_DEFAULTS["takeover"].rate
+    takeover_concurrency: int = default_param("takeover", "concurrency")
+    takeover_http_timeout: int = default_param("takeover", "http_timeout")
+    naabu: bool = MODULE_DEFAULTS["naabu"].enabled
+    naabu_rate: int = MODULE_DEFAULTS["naabu"].rate
+    ports: str = default_param("naabu", "ports")                    # top-100 | top-1000 | liste (80,443,8080-8090)
+    naabu_allow_full: bool = default_param("naabu", "allow_full")
+    httpx_ports: bool = MODULE_DEFAULTS["httpx_ports"].enabled
+    httpx_ports_rate: int = MODULE_DEFAULTS["httpx_ports"].rate
+    arjun: bool = MODULE_DEFAULTS["arjun"].enabled
+    arjun_rate: int = MODULE_DEFAULTS["arjun"].rate
+    arjun_max: int = default_param("arjun", "max_urls")
+    arjun_threads: int = default_param("arjun", "threads")
+    arjun_http_timeout: int = default_param("arjun", "http_timeout")
+    arjun_stable: bool = default_param("arjun", "stable")
     # Timeouts de module en secondes (None = illimité) : surcharge de `config.MODULE_DEFAULTS`.
     timeouts: Dict[str, Optional[int]] = field(default_factory=dict)
     skip_subfinder: bool = False
@@ -474,6 +517,7 @@ def stage_katana(
     ignore_query: bool,
     filter_similar: bool,
     timeout: Optional[int] = None,
+    store_dir: Optional[Path] = None,
 ) -> Tuple[int, float]:
     command = [
         "katana",
@@ -501,9 +545,115 @@ def stage_katana(
         command += ["-crawl-duration", duration.strip()]  # coupe après la durée
     if js_crawl:
         command.append("-jc")
+    if store_dir is not None:
+        # Réponses brutes sur disque : jsluice et secrets travaillent hors ligne dessus (aucune requête de plus).
+        command += ["-store-response", "-store-response-dir", str(store_dir)]
     command += ["-o", str(destination)]
     _, elapsed, _ = runner.run_command(command, "katana", watch=destination, timeout=timeout)
     return write_lines(destination, read_lines(destination)), elapsed
+
+
+def stage_jsluice(files_list: Path, destination: Path, mode: str, concurrency: int, timeout: Optional[int] = None) -> float:
+    """`jsluice urls|secrets` sur les fichiers listés dans `files_list`. Sans argument fichier,
+    jsluice lit les chemins sur l'entrée standard (un par ligne) : pas de limite de longueur de
+    commande. Sortie standard (un objet JSON par ligne, champ `filename`) capturée dans
+    `destination` ; jsluice n'a pas de `-silent` (`silent=False`). Local : aucune requête."""
+    _, elapsed, _ = runner.run_command(
+        ["jsluice", mode, "-c", str(concurrency)], f"jsluice {mode}",
+        watch=destination, stdout_to=destination, stdin_from=files_list, silent=False, timeout=timeout,
+    )
+    return elapsed
+
+
+def stage_trufflehog(directory: Path, destination: Path, timeout: Optional[int] = None) -> float:
+    """trufflehog sur un dossier. **`--no-verification` toujours** : vérifier un secret revient à
+    l'essayer chez son fournisseur, c'est-à-dire à utiliser un identifiant tiers trouvé — hors
+    périmètre. Jamais `--only-verified` / `--results=verified`. Sortie JSON (une ligne par
+    découverte) sur la sortie standard, capturée ; pas de `-silent` (`silent=False`)."""
+    _, elapsed, _ = runner.run_command(
+        ["trufflehog", "filesystem", str(directory), "--no-verification", "--json", "--no-update", "--no-color"],
+        "trufflehog", watch=destination, stdout_to=destination, silent=False, timeout=timeout,
+    )
+    return elapsed
+
+
+def stage_gitleaks(directory: Path, report_file: Path, timeout: Optional[int] = None) -> float:
+    """gitleaks (repli de trufflehog) : `gitleaks dir` (v8.19+), sinon l'ancien
+    `gitleaks detect --no-git --source` ; rapport JSON dans `report_file`. `--exit-code 0` :
+    des fuites trouvées ne sont pas une erreur ; pas de `--redact` (la preuve reste sur disque,
+    dans 10_secrets.jsonl) mais jamais affichée."""
+    report_file.unlink(missing_ok=True)
+    tail = ["--report-format", "json", "--report-path", str(report_file), "--no-banner", "--exit-code", "0", "--log-level", "error"]
+    rc, elapsed, _ = runner.run_command(
+        ["gitleaks", "dir", str(directory), *tail], "gitleaks", silent=False, timeout=timeout
+    )
+    if rc not in (0, 124) and not report_file.exists():
+        _, again, _ = runner.run_command(
+            ["gitleaks", "detect", "--no-git", "--source", str(directory), *tail], "gitleaks", silent=False, timeout=timeout
+        )
+        elapsed += again
+    return elapsed
+
+
+def stage_dnsx_cname(source: Path, destination: Path, timeout: Optional[int] = None) -> Tuple[int, float]:
+    """`dnsx -cname -resp -json` : enregistrements CNAME des hôtes vivants (interroge les résolveurs,
+    pas la cible). Une ligne JSON par hôte, champ `cname`."""
+    destination.unlink(missing_ok=True)
+    command = ["dnsx", "-l", str(source), "-cname", "-resp", "-json", "-o", str(destination)]
+    _, elapsed, _ = runner.run_command(command, "dnsx cname", watch=destination, timeout=timeout)
+    return count_lines(destination), elapsed
+
+
+def stage_subzy(
+    targets: Path, output: Path, concurrency: int, http_timeout: int, timeout: Optional[int] = None
+) -> float:
+    """subzy sur les seuls candidats (CNAME hors périmètre). `--hide_fails` : seuls les cas utiles
+    à l'écran ; `--https` : schéma par défaut des hôtes nus ; JAMAIS `--verify_ssl` (un certificat
+    invalide ne doit pas masquer un service dangling). Résultats : tableau JSON dans `output`.
+    Pas de `-silent` (`silent=False`)."""
+    output.unlink(missing_ok=True)
+    command = [
+        "subzy", "run", "--targets", str(targets), "--concurrency", str(concurrency),
+        "--timeout", str(http_timeout), "--hide_fails", "--https", "--output", str(output),
+    ]
+    _, elapsed, _ = runner.run_command(command, "subzy", silent=False, timeout=timeout)
+    return elapsed
+
+
+def stage_naabu(
+    hosts: Path, destination: Path, ports: Sequence[str], rate: int, timeout: Optional[int] = None
+) -> Tuple[int, float]:
+    """naabu sur les hôtes vivants. `-exclude-cdn` : derrière un CDN/WAF seuls 80/443 sont sondés
+    (inutile — et mal vu — de scanner l'infrastructure d'un tiers) ; `-rate` = débit accordé
+    (paquets/s) ; `-retries 1` (défaut 3) ; type de scan laissé à naabu (CONNECT sans root, SYN
+    sinon). Sortie JSON (`host`, `ip`, `port`) dans `destination`, écrite au fil de l'eau (un
+    timeout garde les ports déjà trouvés)."""
+    destination.unlink(missing_ok=True)
+    command = [
+        "naabu", "-list", str(hosts), *ports, "-rate", str(rate), "-retries", "1",
+        "-exclude-cdn", "-json", "-o", str(destination),
+    ]
+    _, elapsed, _ = runner.run_command(command, "naabu", watch=destination, timeout=timeout)
+    return count_lines(destination), elapsed
+
+
+def stage_arjun(
+    source: Path, destination: Path, rate: int, threads: int, http_timeout: int, stable: bool,
+    timeout: Optional[int] = None,
+) -> float:
+    """arjun (GET) sur une liste d'URLs. `--rate-limit` = débit accordé (req/s) ; `-t` threads ;
+    `-T` délai par requête. `--stable` (1 thread + 3 à 9 s de pause par requête) est désactivé par
+    défaut : avec ~100+ requêtes par URL il rendrait le module inutilisable ; le débit est borné
+    par `--rate-limit`. Sortie JSON `-oJ` ; pas de `-silent` (`silent=False`)."""
+    destination.unlink(missing_ok=True)
+    command = [
+        "arjun", "-i", str(source), "-oJ", str(destination), "-m", "GET",
+        "-t", str(threads), "-T", str(http_timeout), "--rate-limit", str(rate),
+    ]
+    if stable:
+        command.append("--stable")
+    _, elapsed, _ = runner.run_command(command, "arjun", silent=False, timeout=timeout)
+    return elapsed
 
 
 def nuclei_pass1_filters(mode: str, severity: str) -> List[str]:
@@ -891,16 +1041,324 @@ def run_katana(ctx: Context) -> ModuleResult:
     seeds, why = katana_seeds(ctx)
     if seeds is None:
         raise ModuleSkipped(f"{why} — katana ne crawle pas de cibles non confirmées")
+    store_dir = paths["responses_dir"] if o.katana_store else None
+    if store_dir is not None:
+        # index.txt est ouvert en ajout par katana : on repart d'un dossier vide (jamais de réponses périmées).
+        shutil.rmtree(store_dir, ignore_errors=True)
+        store_dir.mkdir(parents=True, exist_ok=True)
     n, elapsed = stage_katana(
         seeds, paths["katana"], o.depth, o.katana_scope, o.js_crawl, ctx.rate, o.concurrency,
         o.katana_max_pages, o.katana_duration, o.katana_ignore_query, o.katana_filter_similar,
-        ctx.remaining(),
+        ctx.remaining(), store_dir,
     )
     ctx.log(report(n, paths["katana"], elapsed))
     n = apply_scope(ctx.scope, paths["katana"], "katana", ctx.log)
     if o.js_crawl:
         ctx.log("[dim]  -jc actif : endpoints extraits du JS non requêtés, donc non validés.[/dim]")
-    return ModuleResult(n)
+    note = ""
+    if store_dir is not None:
+        files, size = surface.dir_size(store_dir)
+        note = f"{files} réponses stockées ({surface.human_size(size)})"
+        ctx.log(f"  [dim]réponses brutes dans {store_dir.relative_to(ctx.output)} (jsluice et secrets les lisent hors ligne)[/dim]")
+    return ModuleResult(n, note=note)
+
+
+def _stored_responses(ctx: Context, stage: str) -> List[surface.StoredResponse]:
+    """Réponses stockées par katana dans CE run, limitées au périmètre (étape `stage`)."""
+    if not ctx.options.katana_store:
+        raise ModuleSkipped("--no-katana-store : katana n'a stocké aucune réponse")
+    if not produced(ctx, "katana"):
+        raise ModuleSkipped("katana n'a pas tourné dans ce run — aucune réponse stockée")
+    responses = surface.read_katana_index(ctx.paths["responses_dir"])
+    if not responses:
+        raise ModuleSkipped("aucune réponse stockée par katana (index vide)")
+    in_scope = set(ctx.scope.filter([r.url for r in responses], stage))
+    return [r for r in responses if r.url in in_scope]
+
+
+def run_jsluice(ctx: Context) -> ModuleResult:
+    """jsluice sur les JS stockés par katana : endpoints (`urls`) et secrets (`secrets`).
+
+    Aucune requête : seulement des fichiers locaux. Le corps de chaque JS est extrait de la
+    réponse brute (jsluice ne voit ni la requête ni les en-têtes). Les endpoints relatifs sont
+    résolus contre l'URL du JS qui les contient ; seuls http(s) en périmètre restent, statiques
+    exclus. Ils ne sont **pas validés** : `merge_map` les prend comme les archives, httpx #2 les
+    teste avant que quoi que ce soit s'en serve. `09_jsluice_secrets.jsonl` = sortie brute de
+    jsluice (secrets en clair : fichier sensible) ; `secrets` en tire le résumé masqué."""
+    o, paths = ctx.options, ctx.paths
+    for key in ("jsluice", "jsluice_secrets"):
+        paths[key].unlink(missing_ok=True)
+    responses = _stored_responses(ctx, "jsluice")
+    js_dir = paths["responses_js"]
+    shutil.rmtree(js_dir, ignore_errors=True)
+    files_list, raw_urls = ctx.output / ".jsluice_files.tmp", ctx.output / ".jsluice_urls.tmp"
+    try:
+        extracted, too_big = surface.extract_js_bodies(responses, js_dir, o.jsluice_max_bytes)
+        if too_big:
+            ctx.log(f"  [dim]{too_big} JS de plus de {surface.human_size(o.jsluice_max_bytes)} ignorés[/dim]")
+        if not extracted:
+            raise ModuleSkipped("aucun fichier JS dans les réponses stockées")
+        write_lines(files_list, [str(path) for path, _ in extracted])
+        lookup = surface.source_lookup(extracted)
+        elapsed = stage_jsluice(files_list, raw_urls, "urls", o.jsluice_concurrency, ctx.remaining())
+        urls = surface.parse_jsluice_urls(read_lines(raw_urls), lookup)
+        elapsed += stage_jsluice(files_list, paths["jsluice_secrets"], "secrets", o.jsluice_concurrency, ctx.remaining())
+    finally:
+        for temp in (files_list, raw_urls):
+            temp.unlink(missing_ok=True)
+        shutil.rmtree(js_dir, ignore_errors=True)
+    secrets = findings.valid_json_lines(paths["jsluice_secrets"])
+    write_lines(paths["jsluice_secrets"], secrets)
+    write_lines(paths["jsluice"], urls)
+    ctx.log(report(len(urls), paths["jsluice"], elapsed))
+    kept = apply_scope(ctx.scope, paths["jsluice"], "jsluice", ctx.log)
+    ctx.log(f"  [dim]{len(extracted)} JS analysés · {len(secrets)} secret(s) candidat(s) → {paths['jsluice_secrets'].name}[/dim]")
+    ctx.log("  [dim]endpoints non validés : ils entrent dans la carte, httpx #2 les teste[/dim]")
+    return ModuleResult(kept, note=f"{len(extracted)} JS · {len(secrets)} secrets")
+
+
+def run_secrets(ctx: Context) -> ModuleResult:
+    """Secrets dans les réponses stockées par katana : trufflehog (**`--no-verification`**), à défaut
+    gitleaks ; les secrets de `jsluice secrets` sont fusionnés au résumé.
+
+    Aucune requête, et surtout aucune vérification : vérifier un secret l'essaierait chez son
+    fournisseur, soit utiliser un identifiant tiers trouvé. `10_secrets.jsonl` = sorties brutes
+    (secrets EN CLAIR : fichier sensible, à ne pas partager) ; `10_secrets.txt` et la console ne
+    montrent que le détecteur, l'URL d'origine et le début du secret suivi de « … »."""
+    paths = ctx.paths
+    for key in ("secrets_jsonl", "secrets_txt"):
+        paths[key].unlink(missing_ok=True)
+    _stored_responses(ctx, "secrets")   # contrôles (option, katana, index) ; l'analyse porte sur le dossier entier
+    lookup = surface.url_lookup(surface.read_katana_index(paths["responses_dir"]))
+    raw = ctx.output / ".secrets.tmp"
+    found: List[surface.SecretFinding] = []
+    try:
+        if shutil.which("trufflehog"):
+            tool = "trufflehog"
+            elapsed = stage_trufflehog(paths["responses_dir"], raw, ctx.remaining())
+            found = surface.parse_trufflehog(read_lines(raw), lookup)
+        else:
+            tool = "gitleaks"
+            elapsed = stage_gitleaks(paths["responses_dir"], raw, ctx.remaining())
+            report_text = raw.read_text(encoding="utf-8", errors="replace") if raw.exists() else ""
+            found = surface.parse_gitleaks(report_text, lookup)
+    finally:
+        raw.unlink(missing_ok=True)
+    sources = [tool]
+    if produced(ctx, "jsluice") and paths["jsluice_secrets"].exists():
+        extra = surface.parse_jsluice_secrets(read_lines(paths["jsluice_secrets"]), lookup)
+        found += extra
+        sources.append(f"jsluice {len(extra)}")
+    # Périmètre : une découverte dont l'URL d'origine est connue et hors périmètre est écartée.
+    urls = sorted({f.url for f in found if f.url})
+    allowed = set(ctx.scope.filter(urls, "secrets"))
+    found = [f for f in found if not f.url or f.url in allowed]
+    unique: Dict[Tuple[str, str, str], surface.SecretFinding] = {}
+    for finding in found:
+        unique.setdefault((finding.detector, finding.url or finding.file, finding.redacted), finding)
+    ordered = sorted(unique.values(), key=lambda f: (f.detector, f.url or f.file, f.redacted))
+    write_lines(paths["secrets_jsonl"], [f.raw for f in ordered])
+    write_lines(paths["secrets_txt"], [surface.summary_line(f) for f in ordered])
+    ctx.log(report(len(ordered), paths["secrets_txt"], elapsed))
+    if ordered:
+        by_detector: Dict[str, int] = {}
+        for finding in ordered:
+            by_detector[finding.detector] = by_detector.get(finding.detector, 0) + 1
+        ctx.log("  [yellow]" + " · ".join(f"{n} {d}" for d, n in sorted(by_detector.items())) + "[/yellow]")
+        ctx.log(
+            f"  [dim]{paths['secrets_jsonl'].name} contient les secrets en clair : ne pas partager ni versionner ; "
+            f"{paths['secrets_txt'].name} ne montre que le début masqué[/dim]"
+        )
+    if tool == "trufflehog":
+        ctx.log("  [dim]trufflehog --no-verification : aucun secret n'est essayé chez son fournisseur[/dim]")
+    return ModuleResult(len(ordered), note=" + ".join(sources))
+
+
+def run_takeover(ctx: Context) -> ModuleResult:
+    """Sous-domaines à risque de takeover : `dnsx -cname` sur les hôtes vivants (résolveurs, pas
+    la cible), candidats = ceux dont un CNAME sort du périmètre (service tiers), puis subzy sur
+    ces seuls candidats (il récupère les hôtes : `network=True`, concurrence basse).
+
+    Sans subzy le module n'échoue pas : `11_takeover_candidates.txt` (liste utile en soi) est
+    écrit et le module est terminé avec une note. Seuls les résultats vulnérables sont gardés
+    (`11_takeover.jsonl` / `.txt`). Avec `-n`, nuclei #1 couvre aussi le tag `takeover` ; subzy
+    reste lancé (empreintes différentes)."""
+    o, paths = ctx.options, ctx.paths
+    if not _hosts_available(ctx):
+        raise ModuleSkipped("aucun hôte en périmètre — rien à analyser")
+    if "hosts_file" not in ctx.state:
+        raise ModuleSkipped("dnsx n'a résolu aucun hôte — pas de CNAME à analyser")
+    for key in ("takeover_candidates", "takeover_jsonl", "takeover_txt"):
+        paths[key].unlink(missing_ok=True)
+    _, elapsed = stage_dnsx_cname(ctx.state["hosts_file"], paths["dnsx_cname"], ctx.remaining())
+    cnames = surface.parse_cname_rows(read_lines(paths["dnsx_cname"]))
+    candidates = surface.takeover_candidates(cnames, scope_apexes(ctx), ctx.scope.excludes)
+    write_lines(paths["takeover_candidates"], list(candidates))
+    count = apply_scope(ctx.scope, paths["takeover_candidates"], "takeover", ctx.log)
+    ctx.log(f"  [dim]{len(cnames)} hôte(s) avec CNAME · {count} pointent hors périmètre → {paths['takeover_candidates'].name}[/dim]")
+    if not count:
+        write_lines(paths["takeover_jsonl"], [])
+        write_lines(paths["takeover_txt"], [])
+        return ModuleResult(0, note="aucun CNAME hors périmètre")
+    if not shutil.which("subzy"):
+        ctx.log("[yellow]subzy introuvable[/yellow] — liste de candidats seulement, à tester à la main ou avec subzy.")
+        return ModuleResult(count, note="subzy introuvable — candidats seulement")
+    result_file = ctx.output / ".subzy.tmp"
+    try:
+        concurrency = max(min(o.takeover_concurrency, ctx.rate), 1)
+        elapsed = stage_subzy(paths["takeover_candidates"], result_file, concurrency, o.takeover_http_timeout, ctx.remaining())
+        rows_out = surface.parse_subzy(result_file.read_text(encoding="utf-8", errors="replace")) if result_file.exists() else []
+    finally:
+        result_file.unlink(missing_ok=True)
+    vulnerable = [row for row in rows_out if surface.is_vulnerable(row)]
+    write_lines(paths["takeover_jsonl"], [json.dumps(row, ensure_ascii=False) for row in vulnerable])
+    write_lines(paths["takeover_txt"], [surface.takeover_line(row) for row in vulnerable])
+    ctx.log(report(len(vulnerable), paths["takeover_txt"], elapsed))
+    if vulnerable:
+        ctx.log(f"  [bold red]{len(vulnerable)} takeover possible(s)[/bold red] — à vérifier à la main")
+    return ModuleResult(len(vulnerable), note=f"{count} candidats testés" + ("" if rows_out else " · subzy sans résultat"))
+
+
+def run_naabu(ctx: Context) -> ModuleResult:
+    """Ports ouverts des hôtes vivants (`02_dnsx.txt`), jamais d'hôte non résolu. `--ports` :
+    top-100 / top-1000 (défaut) / liste ; `full` refusé sauf `--naabu-allow-full`. `-exclude-cdn` :
+    derrière un CDN/WAF seuls 80/443 sont sondés. Le débit accordé est passé à `-rate`.
+    Résultats filtrés au périmètre : `12_naabu.jsonl` (sortie naabu) et `12_ports.txt` (`hôte:port`)."""
+    o, paths = ctx.options, ctx.paths
+    if not _hosts_available(ctx):
+        raise ModuleSkipped("aucun hôte en périmètre — rien à scanner")
+    if "hosts_file" not in ctx.state:
+        raise ModuleSkipped("dnsx n'a résolu aucun hôte — naabu ne scanne pas d'hôtes non confirmés")
+    try:
+        flags = surface.port_flags(o.ports, o.naabu_allow_full)
+    except ValueError as exc:
+        raise ModuleError(str(exc)) from None
+    for key in ("naabu_jsonl", "ports"):
+        paths[key].unlink(missing_ok=True)
+    hosts = ctx.state["hosts_file"]
+    ports_each = surface.port_count(flags)
+    ctx.log(eta_line(count_lines(hosts) * ports_each, ctx.rate, f"sondes ({o.ports}) @ {ctx.rate}/s"))
+    if ports_each > surface.MAX_EXPLICIT_PORTS:
+        ctx.log("[yellow]Scan de tous les ports (--naabu-allow-full) : très long et très bruyant.[/yellow]")
+    _, elapsed = stage_naabu(hosts, paths["naabu_jsonl"], flags, ctx.rate, ctx.remaining())
+    entries = surface.parse_naabu(read_lines(paths["naabu_jsonl"]))
+    wanted = [f"{host}:{port}" for host, port, _ in entries]
+    allowed = set(ctx.scope.filter(wanted, "naabu"))
+    kept = [(entry, line) for entry, (_, _, line) in zip(wanted, entries) if entry in allowed]
+    if len(kept) != len(entries):
+        ctx.log(f"  [dim]scope : {len(entries) - len(kept)} hors périmètre écartés ({paths['rejected_scope'].name})[/dim]")
+    write_lines(paths["naabu_jsonl"], [line for _, line in kept])
+    write_lines(paths["ports"], [entry for entry, _ in kept])
+    ctx.log(report(len(kept), paths["ports"], elapsed))
+    return ModuleResult(len(kept), note=o.ports)
+
+
+def run_httpx_ports(ctx: Context) -> ModuleResult:
+    """httpx sur les services `hôte:port` trouvés par naabu, hors 80/443 (déjà vus par httpx #1).
+    Sortie `13_httpx_ports.jsonl` ; `urls_live_ports.txt` = URLs dont le code est « vivant »,
+    en périmètre. Ces services rejoignent les listes finales (httpx #2 reprend les lignes du
+    JSONL) et, avec `-n`, `nuclei_ports` les scanne."""
+    o, paths = ctx.options, ctx.paths
+    for key in ("httpx_ports_input", "httpx_ports_jsonl", "urls_live_ports"):
+        paths[key].unlink(missing_ok=True)
+    if not produced(ctx, "naabu"):
+        raise ModuleSkipped("naabu n'a pas tourné dans ce run — aucun service à valider")
+    web = surface.web_candidates(read_lines(paths["ports"]))
+    if not write_lines(paths["httpx_ports_input"], web):
+        raise ModuleSkipped("aucun port web hors 80/443")
+    ctx.log(eta_line(len(web), ctx.rate, f"requêtes @ {ctx.rate}/s"))
+    # split=False : seul le JSONL nous intéresse ici (les chemins de listes passés ne sont pas écrits).
+    _, _, _, elapsed = stage_httpx(
+        ctx.state["httpx_path"], paths["httpx_ports_input"], paths["httpx_ports_jsonl"], paths["urls_live_ports"],
+        paths["urls_live_ports"], paths["urls_live_ports"], o.match_codes, o.threads, ctx.rate,
+        o.live_code_set, ctx.remaining(), "httpx ports", split=False,
+    )
+    rows = list(iter_httpx_rows(read_lines(paths["httpx_ports_jsonl"])))
+    live = filter_live(rows, o.live_code_set or parse_codes(o.live_codes))
+    write_lines(paths["urls_live_ports"], live)
+    ctx.log(report(len(rows), paths["httpx_ports_jsonl"], elapsed))
+    kept = apply_scope(ctx.scope, paths["urls_live_ports"], "httpx_ports", ctx.log)
+    ctx.log(f"  [green]→ {kept} vivants ({o.live_codes})[/green] · {paths['urls_live_ports'].name}")
+    ctx.state["httpx_ports_ran"] = True
+    return ModuleResult(len(rows), note=f"{len(web)} services testés")
+
+
+def port_rows(ctx: Context) -> List[Dict[str, Any]]:
+    """Lignes httpx des services hors 80/443, SEULEMENT si `httpx_ports` les a produites dans CE run."""
+    if not ctx.state.get("httpx_ports_ran"):
+        return []
+    return list(iter_httpx_rows(read_lines(ctx.paths["httpx_ports_jsonl"])))
+
+
+def run_nuclei_ports(ctx: Context) -> ModuleResult:
+    """nuclei sur les services web hors 80/443 : mêmes réglages que la passe 1 (par racine
+    `scheme://hôte:port`, `-as` selon `--nuclei-mode`, `-etags fuzz,dos,intrusive`, jamais `-dast`).
+    Opt-in (`-n`) et suit `--nuclei-passes` (variante de la passe 1). Sortie : `nuclei_ports.jsonl`,
+    reprise dans `nuclei.txt`."""
+    o, paths = ctx.options, ctx.paths
+    for key in ("nuclei_ports_input", "nuclei_ports_jsonl"):
+        paths[key].unlink(missing_ok=True)
+    if not ctx.state.get("httpx_ports_ran"):
+        raise ModuleSkipped("httpx_ports n'a pas tourné — aucun service confirmé vivant")
+    live_urls = [u for u in read_lines(paths["urls_live_ports"]) if u.startswith(("http://", "https://"))]
+    before = len(live_urls)
+    live_urls = ctx.scope.filter(live_urls, "nuclei_ports")
+    if before != len(live_urls):
+        ctx.log(f"  [dim]scope : {before - len(live_urls)} hors périmètre écartés ({paths['rejected_scope'].name})[/dim]")
+    count_in = write_lines(paths["nuclei_ports_input"], dedupe_hosts(live_urls))
+    if not count_in:
+        raise ModuleSkipped("aucun service web vivant hors 80/443")
+    _warn_no_scope(ctx, count_in, "services")
+    filters = nuclei_pass1_filters(o.nuclei_mode, o.nuclei_severity)
+    ctx.log(
+        f"  [dim]mode {o.nuclei_mode} · {count_in} service(s) · sévérité {o.nuclei_severity} · "
+        f"-etags {NUCLEI1_EXCLUDE_TAGS} · {ctx.rate}/s accordés[/dim]"
+    )
+    part = findings.part_path(paths["nuclei_ports_jsonl"], 1)
+    try:
+        stage_nuclei(
+            paths["nuclei_ports_input"], part, filters, ctx.rate, o.nuclei_max_host_error, o.nuclei_timeout,
+            o.nuclei_concurrency, o.nuclei_retries, ctx.remaining(), "nuclei ports",
+        )
+    finally:
+        total = findings.merge_jsonl([part], paths["nuclei_ports_jsonl"])
+    ctx.log(report(total, paths["nuclei_ports_jsonl"], 0.0))
+    return ModuleResult(total)
+
+
+def run_arjun(ctx: Context) -> ModuleResult:
+    """arjun sur quelques URLs vivantes représentatives : une par signature, statiques exclues, URLs
+    prioritaires (admin, api, upload…) d'abord, plafonnées à `--arjun-max` (30) car arjun envoie des
+    centaines de requêtes par URL. Débit accordé via `--rate-limit`. Sortie `14_arjun.json` ;
+    `14_arjun_params.txt` = une URL par jeu de paramètres trouvé (valeurs factices `=1`, paramètres
+    existants conservés), en périmètre. Sans `-n` c'est un livrable de surface ; avec `-n`, nuclei #2
+    les ajoute à son run DAST."""
+    o, paths = ctx.options, ctx.paths
+    for key in ("arjun_input", "arjun_json", "arjun_params"):
+        paths[key].unlink(missing_ok=True)
+    if not _hosts_available(ctx):
+        raise ModuleSkipped("aucun hôte en périmètre — rien à analyser")
+    live_urls = _live_candidates(ctx, "arjun")
+    targets = surface.pick_arjun_targets(live_urls, o.arjun_max)
+    if not write_lines(paths["arjun_input"], targets):
+        raise ModuleSkipped("aucune URL vivante non statique pour arjun")
+    priority = sum(1 for u in targets if signatures.is_priority(u))
+    ctx.log(
+        f"  [dim]{len(live_urls)} URLs vivantes → {len(targets)} retenues (plafond {o.arjun_max}, "
+        f"{priority} prioritaires d'abord) · {ctx.rate}/s accordés[/dim]"
+    )
+    if o.arjun_stable:
+        ctx.log("  [yellow]--arjun-stable : 1 thread et 3 à 9 s de pause par requête, très lent[/yellow]")
+    elapsed = stage_arjun(
+        paths["arjun_input"], paths["arjun_json"], ctx.rate, o.arjun_threads, o.arjun_http_timeout,
+        o.arjun_stable, ctx.remaining(),
+    )
+    text = paths["arjun_json"].read_text(encoding="utf-8", errors="replace") if paths["arjun_json"].exists() else ""
+    found = surface.parse_arjun(text)
+    write_lines(paths["arjun_params"], surface.arjun_param_urls(found))
+    ctx.log(report(len(found), paths["arjun_json"], elapsed))
+    kept = apply_scope(ctx.scope, paths["arjun_params"], "arjun", ctx.log)
+    return ModuleResult(kept, note=f"{len(targets)} URLs testées · {len(found)} avec paramètres")
 
 
 def reduce_archive(urls: Sequence[str], dedupe: bool, k: int) -> Tuple[List[str], Dict[str, int]]:
@@ -983,7 +1441,9 @@ def run_httpx2(ctx: Context) -> ModuleResult:
     réels, liste complète des 200 et surface vivante propre."""
     o, paths = ctx.options, ctx.paths
     total = ctx.state.get("map_total", 0)
-    if not total:
+    extra_rows = port_rows(ctx)
+    ports_live = bool(extra_rows) and count_lines(paths["urls_live_ports"]) > 0
+    if not total and not ports_live:
         raise ModuleSkipped("carte vide — rien à revalider")
     map_urls = read_lines(paths["all_urls"])
     map_set = set(map_urls)
@@ -1007,6 +1467,10 @@ def run_httpx2(ctx: Context) -> ModuleResult:
         paths["httpx2_jsonl"].write_text("", encoding="utf-8")
     new_rows = list(iter_httpx_rows(read_lines(paths["httpx2_jsonl"])))
     rows = union_rows(first_rows, new_rows, only=map_set)
+    if extra_rows:
+        # Services web hors 80/443 (naabu → httpx_ports) : déjà validés, repris tels quels dans les listes finales.
+        rows = union_rows(rows, extra_rows)
+        ctx.log(f"  [dim]+ {len(extra_rows)} service(s) hors 80/443 (httpx_ports)[/dim]")
     total_v, alive, live = split_httpx_rows(
         rows, paths["urls_all_final"], paths["urls_200_final"], paths["urls_live_final"], o.live_code_set
     )
@@ -1107,8 +1571,8 @@ def run_nuclei1(ctx: Context) -> ModuleResult:
     return ModuleResult(total, note=f"{len(normal)} normaux · {len(waf)} WAF/CDN" if waf else "")
 
 
-def _nuclei2_candidates(ctx: Context) -> List[str]:
-    """URLs vivantes de la passe 2 : liste live la plus à jour (httpx #2, sinon #1),
+def _live_candidates(ctx: Context, stage: str) -> List[str]:
+    """URLs vivantes (passe 2 de nuclei, arjun) : liste live la plus à jour (httpx #2, sinon #1),
     avec le repli historique si httpx n'a pas tourné (--skip-httpx)."""
     paths = ctx.paths
     lists = live_lists(ctx)
@@ -1123,7 +1587,7 @@ def _nuclei2_candidates(ctx: Context) -> List[str]:
         unvalidated = ctx.state.get("archive_only", set())
         live_urls = [u for u in clean_live_urls(live_all_file, paths["all_urls"]) if u not in unvalidated]
     before = len(live_urls)
-    live_urls = ctx.scope.filter(live_urls, "nuclei2")
+    live_urls = ctx.scope.filter(live_urls, stage)
     if before != len(live_urls):
         ctx.log(f"  [dim]scope : {before - len(live_urls)} hors périmètre écartés ({paths['rejected_scope'].name})[/dim]")
     return live_urls
@@ -1143,7 +1607,7 @@ def run_nuclei2(ctx: Context) -> ModuleResult:
     if not _hosts_available(ctx):
         raise ModuleSkipped("aucun hôte en périmètre — rien à scanner")
 
-    live_urls = _nuclei2_candidates(ctx)
+    live_urls = _live_candidates(ctx, "nuclei2")
     dynamic = [u for u in live_urls if not signatures.is_static(u)]
     reps = signatures.representatives(dynamic, o.nuclei_k)
     for key in ("nuclei2_input", "nuclei2_params", "nuclei2_priority"):
@@ -1157,6 +1621,12 @@ def run_nuclei2(ctx: Context) -> ModuleResult:
     )
 
     with_params = [u for u in reps if signatures.has_params(u)]
+    # Paramètres cachés trouvés par arjun dans CE run : ajoutés APRÈS la réduction par signature
+    # (leur jeu de paramètres est inédit), toujours filtrés sur le périmètre.
+    if produced(ctx, "arjun") and paths["arjun_params"].exists():
+        from_arjun = ctx.scope.filter(read_lines(paths["arjun_params"]), "nuclei2")
+        with_params = list(dict.fromkeys(with_params + from_arjun))
+        ctx.log(f"  [dim]+ {len(from_arjun)} URL(s) à paramètres d'arjun pour le run DAST[/dim]")
     write_lines(paths["nuclei2_params"], with_params)
     priority: List[str] = []
     if o.nuclei_priority:
@@ -1199,7 +1669,7 @@ def run_nuclei2(ctx: Context) -> ModuleResult:
 
 
 def finalize_nuclei(ctx: Context) -> Optional[Dict[str, int]]:
-    """Fin de run : `nuclei.txt` = vue lisible fusionnée des deux passes.
+    """Fin de run : `nuclei.txt` = vue lisible fusionnée des deux passes (et des services hors 80/443).
 
     Seules les passes qui ont réellement produit leur JSONL dans CE run (terminées
     ou en timeout) comptent — un JSONL périmé d'un run précédent est ignoré. Retourne
@@ -1207,7 +1677,9 @@ def finalize_nuclei(ctx: Context) -> Optional[Dict[str, int]]:
     `nuclei.txt` périmé)."""
     paths = ctx.paths
     produced = [
-        paths[key] for module, key in (("nuclei1", "nuclei1_jsonl"), ("nuclei2", "nuclei2_jsonl"))
+        paths[key] for module, key in (
+            ("nuclei1", "nuclei1_jsonl"), ("nuclei_ports", "nuclei_ports_jsonl"), ("nuclei2", "nuclei2_jsonl"),
+        )
         if ctx.status(module) in (Status.DONE, Status.TIMEOUT) and paths[key].exists()
     ]
     if not produced:
@@ -1290,15 +1762,51 @@ def build_modules(o: Options) -> List[Module]:
         Module(
             "katana", ["httpx"], run_katana, binaries=["katana"], enabled=not o.skip_katana,
             network=True, rate=o.rate_limit, timeout=timeout("katana"),
-            icon=icon("katana", "•"), desc="crawl actif depuis les seeds vivantes",
+            icon=icon("katana", "•"),
+            desc="crawl actif depuis les seeds vivantes" + (" · réponses stockées" if o.katana_store else ""),
+        ),
+        # Déclarés APRÈS katana : à budget égal le crawl garde la priorité (nuclei 50 + katana 100) ;
+        # takeover et naabu prennent ce qui reste et attendent sinon.
+        Module(
+            "takeover", ["dnsx"], run_takeover, binaries=["dnsx"], enabled=o.takeover,
+            network=True, rate=o.takeover_rate, timeout=timeout("takeover"),
+            icon=icon("takeover", "•"), desc="CNAME hors périmètre (dnsx) + subzy sur ces seuls candidats",
         ),
         Module(
-            "merge_map", ["katana", "gau", "waybackurls"], run_merge_map,
-            icon=icon("merge_map", "•"), desc="carte finale (seeds + crawl + archives) + périmètre strict",
+            "naabu", ["dnsx"], run_naabu, binaries=["naabu"], enabled=o.naabu,
+            network=True, rate=o.naabu_rate, timeout=timeout("naabu"),
+            icon=icon("naabu", "•"), desc=f"ports des hôtes vivants · {o.ports} · -exclude-cdn",
         ),
-        # Valide aussi les URLs d'archive (jamais testées avant) : actif même sans katana.
         Module(
-            "httpx2", ["merge_map"], run_httpx2, binaries=["httpx"],
+            "httpx_ports", ["naabu"], run_httpx_ports, binaries=["httpx"],
+            enabled=o.httpx_ports and not o.skip_httpx,
+            network=True, rate=o.httpx_ports_rate, timeout=timeout("httpx_ports"), label="httpx ports",
+            icon=icon("httpx_ports", "•"), desc="services web hors 80/443 trouvés par naabu",
+        ),
+        Module(
+            "nuclei_ports", ["httpx_ports"], run_nuclei_ports, binaries=["nuclei"],
+            enabled=o.nuclei_pass_enabled(1), network=True, rate=o.nuclei_rate_limit,
+            timeout=timeout("nuclei_ports"), label="nuclei ports",
+            icon=icon("nuclei_ports", "•"), desc=f"réglages passe 1 · services hors 80/443 · mode {o.nuclei_mode}",
+        ),
+        Module(
+            "jsluice", ["katana"], run_jsluice, binaries=["jsluice"], enabled=o.jsluice,
+            timeout=timeout("jsluice"), icon=icon("jsluice", "•"),
+            desc="endpoints et secrets des JS stockés par katana (hors ligne)",
+        ),
+        Module(
+            "secrets", ["katana", "jsluice"], run_secrets, binaries_any=["trufflehog", "gitleaks"],
+            enabled=o.secrets, timeout=timeout("secrets"), icon=icon("secrets", "•"),
+            desc="secrets des réponses stockées · trufflehog --no-verification (sinon gitleaks)",
+        ),
+        Module(
+            "merge_map", ["katana", "gau", "waybackurls", "jsluice"], run_merge_map,
+            icon=icon("merge_map", "•"), desc="carte finale (seeds + crawl + archives + JS) + périmètre strict",
+        ),
+        # Valide aussi les URLs d'archive et de JS (jamais testées avant) : actif même sans katana.
+        # Attend httpx_ports : les services hors 80/443 rejoignent les listes finales.
+        Module(
+            "httpx2", ["merge_map", "httpx_ports"], run_httpx2, binaries=["httpx"],
             enabled=o.revalidate and not o.skip_httpx,
             network=True, rate=o.rate_limit, timeout=timeout("httpx2"), label="httpx #2",
             icon=icon("httpx2", "•"), desc="validation des URLs de la carte absentes d'httpx #1",
@@ -1308,7 +1816,12 @@ def build_modules(o: Options) -> List[Module]:
             icon=icon("tree", "•"), desc="arbre HTML interactif des 200",
         ),
         Module(
-            "nuclei2", ["httpx2"], run_nuclei2, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(2),
+            "arjun", ["httpx2"], run_arjun, binaries=["arjun"], enabled=o.arjun,
+            network=True, rate=o.arjun_rate, timeout=timeout("arjun"),
+            icon=icon("arjun", "•"), desc=f"paramètres cachés · ≤ {o.arjun_max} URLs représentatives",
+        ),
+        Module(
+            "nuclei2", ["httpx2", "arjun"], run_nuclei2, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(2),
             network=True, rate=o.nuclei2_rate_limit, timeout=timeout("nuclei2"), label="nuclei #2",
             icon=icon("nuclei2", "•"), desc=f"passe 2 · URLs représentantes (K={o.nuclei_k}) · DAST + exposition",
         ),

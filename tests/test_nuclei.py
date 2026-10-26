@@ -85,18 +85,20 @@ def test_passes_select_the_enabled_modules():
     def enabled(**opts):
         return {m.name: m.enabled for m in build_modules(Options(target="example.com", **opts)) if m.name.startswith("nuclei")}
 
-    assert enabled() == {"nuclei1": False, "nuclei2": False}                                   # sans -n : rien
-    assert enabled(nuclei_passes="1,2") == {"nuclei1": False, "nuclei2": False}               # les passes seules n'activent rien
-    assert enabled(nuclei=True) == {"nuclei1": True, "nuclei2": True}
-    assert enabled(nuclei=True, nuclei_passes="1") == {"nuclei1": True, "nuclei2": False}
-    assert enabled(nuclei=True, nuclei_passes="2") == {"nuclei1": False, "nuclei2": True}
+    off = {"nuclei1": False, "nuclei_ports": False, "nuclei2": False}
+    assert enabled() == off                                                                    # sans -n : rien
+    assert enabled(nuclei_passes="1,2") == off                                                # les passes seules n'activent rien
+    assert enabled(nuclei=True) == {"nuclei1": True, "nuclei_ports": True, "nuclei2": True}
+    # nuclei_ports est une variante de la passe 1 : il suit --nuclei-passes comme elle.
+    assert enabled(nuclei=True, nuclei_passes="1") == {"nuclei1": True, "nuclei_ports": True, "nuclei2": False}
+    assert enabled(nuclei=True, nuclei_passes="2") == {"nuclei1": False, "nuclei_ports": False, "nuclei2": True}
 
 
 def test_nuclei1_is_declared_before_katana_and_depends_on_httpx_not_httpx2():
     modules = {m.name: m for m in build_modules(Options(target="example.com", nuclei=True))}
     order = [m.name for m in build_modules(Options(target="example.com", nuclei=True))]
     assert order.index("nuclei1") < order.index("katana")
-    assert modules["nuclei1"].deps == ["httpx"] and modules["nuclei2"].deps == ["httpx2"]
+    assert modules["nuclei1"].deps == ["httpx"] and modules["nuclei2"].deps == ["httpx2", "arjun"]
     assert modules["nuclei1"].rate == 50 and modules["nuclei2"].rate == 150
     assert "nuclei" not in modules                                                              # l'ancien module n'existe plus
 
@@ -142,7 +144,7 @@ def test_clean_removes_new_and_legacy_nuclei_files(tmp_path):
 def test_without_n_httpx_command_has_no_cdn_and_nothing_nuclei_runs(tmp_path, monkeypatch):
     scheduler, ctx, tools = run_dag(tmp_path, monkeypatch)
     httpx_commands = [c for label, c in tools.commands if label.startswith("httpx")]
-    assert len(httpx_commands) == 2 and all("-cdn" not in c for c in httpx_commands)
+    assert len(httpx_commands) == 3 and all("-cdn" not in c for c in httpx_commands)       # httpx, httpx #2, httpx ports
     assert statuses(scheduler)["nuclei1"] is Status.SKIPPED and statuses(scheduler)["nuclei2"] is Status.SKIPPED
     assert "nuclei" not in tools.calls and "gf" not in tools.calls
     assert scheduler.records["katana"].rate == 150
@@ -467,7 +469,8 @@ def test_katana_file_is_used_when_katana_ran(tmp_path, monkeypatch):
 
 
 def test_nuclei_txt_is_the_merged_sorted_view(tmp_path, monkeypatch):
-    scheduler, ctx, _ = run_dag(tmp_path, monkeypatch, nuclei=True)
+    # Sans naabu, jsluice ni arjun : on retrouve les deux passes seules (ports, JS et arjun ont leurs propres tests).
+    scheduler, ctx, _ = run_dag(tmp_path, monkeypatch, nuclei=True, naabu=False, jsluice=False, arjun=False)
     counts = finalize_nuclei(ctx)
     view = lines(tmp_path / "nuclei.txt")
     assert view and all(l.startswith(("[medium] ", "[info] ")) for l in view)
