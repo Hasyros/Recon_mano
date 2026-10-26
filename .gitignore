@@ -13,6 +13,7 @@
 !/pyproject.toml
 !/requirements.txt
 !/recon_mano/
+!/tests/
 
 # Python
 __pycache__/

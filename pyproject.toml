@@ -22,6 +22,9 @@ dependencies = [
   "rich",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
 recon_mano = "recon_mano.cli:entrypoint"
 recon-mano = "recon_mano.cli:entrypoint"

@@ -17,7 +17,6 @@ Invocation minimale::
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 import sys
@@ -42,7 +41,15 @@ from rich.table import Table
 from rich.text import Text
 from rich import box
 
+from .io_utils import count_lines, read_lines, write_lines
+from .liveness import (
+    DEFAULT_LIVE_CODES,
+    clean_live_urls,
+    parse_codes,
+    split_httpx_output,
+)
 from .report import write_report as write_tree_report
+from .scope import ScopeFilter, host_of, in_scope, parse_domains, scope_urls  # noqa: F401
 
 # La console Windows est en cp1252 par défaut : accents et flèches du rendu Rich
 # y lèvent un UnicodeEncodeError. On bascule en UTF-8 tolérant avant tout.
@@ -81,11 +88,14 @@ ARTIFACT_NAMES = [
     "05_httpx.jsonl",
     "urls_all.txt",
     "urls_200.txt",
+    "urls_live.txt",
     "06_katana.txt",
     "all_urls.txt",
     "08_httpx2.jsonl",
     "urls_all_final.txt",
     "urls_200_final.txt",
+    "urls_live_final.txt",
+    "rejected_scope.tsv",
     "07_nuclei_input.txt",
     "nuclei.txt",
     "urls_tree.html",
@@ -108,15 +118,6 @@ def human_duration(seconds: float) -> str:
         return f"{minutes}m{secs:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m"
-
-
-def count_lines(path: Path) -> int:
-    """Compte les lignes en binaire — rapide même sur des fichiers volumineux."""
-    try:
-        with path.open("rb") as handle:
-            return sum(chunk.count(b"\n") for chunk in iter(lambda: handle.read(1 << 20), b""))
-    except OSError:
-        return 0
 
 
 def format_eta(count: int, per_second: float) -> Optional[str]:
@@ -355,55 +356,11 @@ def resolve_httpx(explicit: Optional[str] = None) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 
 
-def read_lines(path: Path) -> List[str]:
-    if not path.exists():
-        return []
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
-        if line.strip()
-    ]
-
-
-def write_lines(path: Path, lines: Sequence[str]) -> int:
-    deduped = list(dict.fromkeys(line for line in lines if line.strip()))
-    path.write_text("\n".join(deduped) + ("\n" if deduped else ""), encoding="utf-8")
-    return len(deduped)
-
-
 def merge_files(sources: Sequence[Path], destination: Path) -> int:
     combined: List[str] = []
     for source in sources:
         combined.extend(read_lines(source))
     return write_lines(destination, combined)
-
-
-def host_of(url: str) -> str:
-    """Hostname d'une URL ou d'un `host[:port]`, sans port ni userinfo, en minuscules."""
-    netloc = urlparse(url).netloc if "://" in url else url.split("/", 1)[0]
-    netloc = netloc.rsplit("@", 1)[-1]  # retire un éventuel user:pass@
-    host = netloc.split(":", 1)[0]      # retire le port
-    return host.strip().strip(".").lower()
-
-
-def in_scope(url: str, apexes: Sequence[str]) -> bool:
-    """True si l'hôte de `url` est l'un des `apexes` ou un de leurs sous-domaines."""
-    host = host_of(url)
-    return bool(host) and any(host == a or host.endswith("." + a) for a in apexes)
-
-
-def scope_urls(lines: Sequence[str], apexes: Sequence[str]) -> List[str]:
-    return [line for line in lines if in_scope(line, apexes)]
-
-
-def clean_live_urls(urls_all_file: Path, fallback_file: Path) -> List[str]:
-    """URLs vivantes propres. urls_all.txt est annoté (`url [code] [titre]…`) :
-    on ne garde que le 1er token (l'URL). Repli sur la carte finale si absent."""
-    if urls_all_file.exists() and count_lines(urls_all_file):
-        raw = [line.split()[0] for line in read_lines(urls_all_file)]
-    else:
-        raw = read_lines(fallback_file)
-    return [u for u in raw if u.startswith(("http://", "https://"))]
 
 
 def dedupe_hosts(urls: Sequence[str]) -> List[str]:
@@ -432,6 +389,16 @@ def clean_artifacts(output: Path) -> None:
             except OSError as exc:
                 console.print(f"[yellow]Impossible de supprimer {target.name} : {exc}[/yellow]")
     console.print(f"[dim]Nettoyage : {removed} ancien(s) fichier(s) supprimé(s).[/dim]\n")
+
+
+def apply_scope(scope_filter: ScopeFilter, path: Path, stage: str) -> int:
+    """Filtre `path` sur le périmètre (réécriture sur place) et retourne le nombre
+    de lignes gardées. Signale ce qui a été écarté ; le détail est dans le TSV."""
+    kept, dropped = scope_filter.filter_file(path, stage)
+    if dropped:
+        log_name = scope_filter.reject_log.name if scope_filter.reject_log else "rejected_scope.tsv"
+        console.print(f"  [dim]scope : {dropped} hors périmètre écartés ({log_name})[/dim]")
+    return kept
 
 
 # --------------------------------------------------------------------------- #
@@ -532,10 +499,15 @@ def stage_httpx(
     jsonl_file: Path,
     all_file: Path,
     ok_file: Path,
+    live_file: Path,
     match_codes: str,
     threads: int,
     rate_limit: int,
-) -> tuple[int, int, float]:
+    live_codes: Optional[set[int]] = None,
+) -> tuple[int, int, int, float]:
+    """Une passe httpx puis éclatement : `all_file` (annoté, tous codes retenus par
+    -mc), `ok_file` (200 seuls) et `live_file` (URLs nues dont le code est dans
+    `live_codes` — seule liste qui alimente katana et nuclei)."""
     _, elapsed, _ = run_command(
         [
             binary,
@@ -558,35 +530,8 @@ def stage_httpx(
         "httpx",
         watch=jsonl_file,
     )
-    total, alive = split_httpx_output(jsonl_file, all_file, ok_file)
-    return total, alive, elapsed
-
-
-def split_httpx_output(jsonl_file: Path, all_file: Path, ok_file: Path) -> tuple[int, int]:
-    annotated: List[str] = []
-    alive: List[str] = []
-    for line in read_lines(jsonl_file):
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        url = row.get("url") or row.get("input")
-        if not url:
-            continue
-        status = row.get("status_code")
-        parts = [url, f"[{status if status is not None else '-'}]"]
-        if row.get("content_length") is not None:
-            parts.append(f"[{row['content_length']}]")
-        title = (row.get("title") or "").replace("\n", " ").strip()
-        if title:
-            parts.append(f"[{title}]")
-        tech = row.get("tech") or []
-        if tech:
-            parts.append(f"[{','.join(tech)}]")
-        annotated.append(" ".join(parts))
-        if status == 200:
-            alive.append(url)
-    return write_lines(all_file, annotated), write_lines(ok_file, alive)
+    total, alive, live = split_httpx_output(jsonl_file, all_file, ok_file, live_file, live_codes)
+    return total, alive, live, elapsed
 
 
 def stage_katana(
@@ -736,7 +681,10 @@ def run_report_command(path_arg: Optional[Path]) -> None:
 
     path = Path(path_arg)
     if path.is_dir():
-        candidates = ["urls_200_final.txt", "urls_200.txt", "urls_all_final.txt", "all_urls.txt", "06_katana.txt"]
+        candidates = [
+            "urls_200_final.txt", "urls_200.txt", "urls_live_final.txt", "urls_live.txt",
+            "urls_all_final.txt", "all_urls.txt", "06_katana.txt",
+        ]
         source = next((path / name for name in candidates if (path / name).exists() and count_lines(path / name)), None)
         if source is None:
             console.print(f"[bold red]Aucune liste d'URLs dans {path}[/bold red] (urls_200_final.txt attendu).")
@@ -778,6 +726,11 @@ def main(
         True, "--wildcard-filter/--no-wildcard-filter", help="dnsx -wd (filtrage wildcard)"
     ),
     match_codes: str = typer.Option(DEFAULT_MATCH_CODES, "--match-codes", help="httpx -mc"),
+    live_codes: str = typer.Option(
+        DEFAULT_LIVE_CODES, "--live-codes",
+        help="Codes HTTP jugés « vivants » : seules ces URLs alimentent katana et nuclei "
+             "(404/5xx exclus). --match-codes, plus large, continue de piloter les fichiers de triage.",
+    ),
     depth: int = typer.Option(2, "--depth", help="Profondeur katana (seeds déjà profondes)"),
     scope: str = typer.Option("rdn", "--scope", help="katana -fs : rdn, fqdn, dn ou regex"),
     js_crawl: bool = typer.Option(False, "--js-crawl", help="katana -jc (endpoints JS, non validés)"),
@@ -803,10 +756,18 @@ def main(
     ),
     in_scope_domains: str = typer.Option(
         "", "--in-scope",
-        help="Restreindre à ces domaines (séparés par des virgules, ex: devinci.fr,esilv.fr,emlv.fr). "
-             "Vide = tout garder. Fortement recommandé avec --nuclei.",
+        help="Domaines AJOUTÉS à la cible dans le périmètre (virgules, ex: devinci.fr,esilv.fr). "
+             "Sans cette option, la question est posée au lancement (terminal) sauf avec -y.",
     ),
-    nuclei: bool = typer.Option(False, "--nuclei", help="Lance nuclei sur les hôtes/URLs vivants"),
+    exclude: str = typer.Option(
+        "", "--exclude",
+        help="Hôtes/domaines explicitement hors périmètre (virgules) : égaux ou sous-domaines d'une entrée.",
+    ),
+    no_scope_filter: bool = typer.Option(
+        False, "--no-scope-filter", help="Désactive tout filtrage de périmètre (comportement historique)"
+    ),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Ne pose aucune question (périmètre = cible + --in-scope, nuclei = hôtes)"),
+    nuclei: bool = typer.Option(False, "-n", "--nuclei", help="Lance nuclei sur les hôtes/URLs vivants"),
     nuclei_mode: str = typer.Option(
         "auto", "--nuclei-mode",
         help="auto (-as tech-aware, défaut) | curated (tags CVE/expo/misconfig, sans fuzz) | full (tout selon --nuclei-severity)",
@@ -830,7 +791,7 @@ def main(
 ):
     """Recon Mano — subfinder → dnsx → urlfinder → httpx → katana → [nuclei].
 
-    Exemple : recon_mano exemple.com sortie --nuclei
+    Exemple : recon_mano exemple.com sortie -n
     """
     global _VERBOSE
     _VERBOSE = verbose
@@ -854,7 +815,7 @@ def main(
             "[bold]Usage :[/bold] recon_mano [cyan]cible.com[/cyan] [cyan]nom_sortie[/cyan] [dim][options][/dim]\n"
             "Exemples :\n"
             "  recon_mano exemple.com sortie\n"
-            "  recon_mano exemple.com sortie --nuclei --clean\n"
+            "  recon_mano exemple.com sortie -n --clean\n"
             "  recon_mano report exemple.com   [dim](re)génère l'arbre HTML[/dim]\n"
             "  recon_mano --check\n"
             "Aide complète : recon_mano --help"
@@ -867,6 +828,22 @@ def main(
     if nuclei_targets is not None and nuclei_targets not in {"hosts", "urls"}:
         console.print("[bold red]--nuclei-targets :[/bold red] hosts | urls")
         raise typer.Exit(code=2)
+
+    try:
+        live_code_set = parse_codes(live_codes)
+    except ValueError:
+        console.print("[bold red]--live-codes :[/bold red] codes HTTP séparés par des virgules (ex: 200,301,403)")
+        raise typer.Exit(code=2)
+
+    # Périmètre : cible + --in-scope (ajout). Question posée UNE fois, au lancement,
+    # seulement en terminal interactif ; la réponse remplace la liste.
+    target_apex = host_of(target) or target.strip().lower()
+    scope_apexes = list(dict.fromkeys([target_apex] + parse_domains(in_scope_domains)))
+    scope_excludes = parse_domains(exclude)
+    scope_enabled = not no_scope_filter
+    if scope_enabled and not in_scope_domains.strip() and not yes and sys.stdin.isatty():
+        answer = typer.prompt("Domaines en scope (virgules)", default=target_apex)
+        scope_apexes = parse_domains(str(answer)) or [target_apex]
 
     # Sortie par défaut = nom de la cible assaini.
     if output is None:
@@ -882,11 +859,14 @@ def main(
     httpx_jsonl_file = output / "05_httpx.jsonl"
     urls_all_file = output / "urls_all.txt"
     urls_200_file = output / "urls_200.txt"
+    urls_live_file = output / "urls_live.txt"
     katana_file = output / "06_katana.txt"
     final_file = output / "all_urls.txt"
     httpx2_jsonl_file = output / "08_httpx2.jsonl"
     urls_all_final_file = output / "urls_all_final.txt"
     urls_200_final_file = output / "urls_200_final.txt"
+    urls_live_final_file = output / "urls_live_final.txt"
+    rejected_scope_file = output / "rejected_scope.tsv"
     nuclei_input_file = output / "07_nuclei_input.txt"
     nuclei_file = output / "nuclei.txt"
     tree_html_file = output / "urls_tree.html"
@@ -895,13 +875,20 @@ def main(
     if nuclei:
         scan_bits.append(f"nuclei {nuclei_mode}·{nuclei_targets or 'demandé'}")
     scan_bits.append(f"revalidate {'on' if revalidate else 'off'}")
-    if in_scope_domains.strip():
-        scan_bits.append(f"scope {in_scope_domains}")
+    if scope_enabled:
+        scan_bits.append(f"scope {','.join(scope_apexes)}")
+        if scope_excludes:
+            scan_bits.append(f"exclu {','.join(scope_excludes)}")
+    else:
+        scan_bits.append("scope off")
     print_banner([("🎯 cible ", target), ("📁 sortie", str(output)), ("⚙️  config", " · ".join(scan_bits))])
 
     summary: List[tuple[str, int, float]] = []
     if clean:
         clean_artifacts(output)
+
+    # Journal des rejets remis à zéro à chaque run (créé ici, après --clean).
+    scope_filter = ScopeFilter(scope_apexes, scope_excludes, rejected_scope_file, enabled=scope_enabled)
 
     httpx_path: Optional[str] = None
     if not skip_httpx:
@@ -927,9 +914,14 @@ def main(
         stage_header("1/6", "subfinder", "sous-domaines théoriques")
         count, elapsed = stage_subfinder(target, subfinder_file, all_sources)
         report(count, subfinder_file, elapsed)
+    raw_count = count
+    count = apply_scope(scope_filter, subfinder_file, "subfinder")
     summary.append(("subfinder", count, elapsed))
     if not count:
-        console.print("[bold red]Aucun sous-domaine trouvé, arrêt.[/bold red]")
+        if raw_count:
+            console.print("[bold red]Aucun sous-domaine dans le périmètre, arrêt.[/bold red]")
+        else:
+            console.print("[bold red]Aucun sous-domaine trouvé, arrêt.[/bold red]")
         raise typer.Exit(code=1)
 
     hosts_file = subfinder_file
@@ -940,6 +932,7 @@ def main(
         announce_eta("dnsx", count, DNSX_NOMINAL_PER_SEC, "hôtes à résoudre")
         n, elapsed = stage_dnsx(subfinder_file, dnsx_file, target, wildcard_filter)
         report(n, dnsx_file, elapsed)
+        n = apply_scope(scope_filter, dnsx_file, "dnsx")
         summary.append(("dnsx", n, elapsed))
         if n:
             hosts_file = dnsx_file
@@ -956,7 +949,8 @@ def main(
             target, urlfinder_file, urlfinder_retries, urlfinder_retry_wait, urlfinder_all
         )
         report(n, urlfinder_file, elapsed)
-        summary.append(("urlfinder", n, elapsed))
+        # `n` brut sert aux diagnostics ci-dessous (throttling) ; le résumé affiche le filtré.
+        summary.append(("urlfinder", apply_scope(scope_filter, urlfinder_file, "urlfinder"), elapsed))
         lines = [line.strip() for line in uf_stderr.splitlines() if line.strip()]
         # Le récap propre de l'outil ("Found N urls … in T") : toujours affiché.
         for line in [l for l in lines if "found" in l.lower() and "url" in l.lower()][-1:]:
@@ -991,28 +985,34 @@ def main(
     console.print(f"\n[bold]Fusion des deux branches[/bold] → {merged} entrées\n")
 
     katana_seeds = httpx_input_file
+    live_urls_files: List[Path] = []  # listes « vivantes » produites par CE run (httpx #2 en tête)
     if skip_httpx:
         console.print("[dim]4 · httpx ignoré — katana partira des entrées brutes[/dim]")
     else:
         stage_header("4/6", "httpx", "validation + annotation (une seule passe)")
         announce_eta("httpx", merged, rate_limit, f"requêtes @ {rate_limit}/s (plancher)")
-        total, alive, elapsed = stage_httpx(
+        total, alive, live, elapsed = stage_httpx(
             httpx_path,  # type: ignore[arg-type]
             httpx_input_file,
             httpx_jsonl_file,
             urls_all_file,
             urls_200_file,
+            urls_live_file,
             match_codes,
             threads,
             rate_limit,
+            live_code_set,
         )
         report(total, urls_all_file, elapsed)
         console.print(f"  [green]→ {alive} en 200[/green] · {urls_200_file.name}")
+        console.print(f"  [green]→ {live} vivants ({live_codes})[/green] · {urls_live_file.name}")
         summary.append(("httpx", total, elapsed))
-        if alive:
-            katana_seeds = urls_200_file
+        live_urls_files.append(urls_live_file)
+        # katana ne reçoit que du confirmé vivant (200/3xx/401/403…), jamais 404/5xx.
+        if live:
+            katana_seeds = urls_live_file
         elif total:
-            console.print("[yellow]Aucun 200 — katana repart des entrées fusionnées[/yellow]")
+            console.print("[yellow]Aucune URL vivante — katana repart des entrées fusionnées[/yellow]")
 
     # --- Crawl actif --------------------------------------------------------- #
     if skip_katana:
@@ -1024,6 +1024,7 @@ def main(
             katana_max_pages, katana_duration, katana_ignore_query, katana_filter_similar,
         )
         report(n, katana_file, elapsed)
+        n = apply_scope(scope_filter, katana_file, "katana")
         summary.append(("katana", n, elapsed))
         if js_crawl:
             console.print("[dim]  -jc actif : endpoints extraits du JS non requêtés, donc non validés.[/dim]")
@@ -1031,15 +1032,9 @@ def main(
     # --- Cartographie finale ------------------------------------------------- #
     total = merge_files([katana_seeds, katana_file], final_file)
 
-    # Restriction de périmètre optionnelle (vide = tout gardé). Les archives font
-    # entrer des hôtes tiers ; --in-scope permet de garder le groupe voulu
-    # (devinci.fr,esilv.fr,emlv.fr…) et d'écarter le reste — surtout avant nuclei.
-    scope_apexes = [d.strip().strip(".").lower() for d in in_scope_domains.split(",") if d.strip()]
-    if scope_apexes:
-        kept = scope_urls(read_lines(final_file), scope_apexes)
-        dropped = total - len(kept)
-        total = write_lines(final_file, kept)
-        console.print(f"[dim]--in-scope {','.join(scope_apexes)} : {dropped} URLs hors périmètre écartées[/dim]")
+    # Périmètre strict sur la carte fusionnée : les archives et le crawl font
+    # entrer des hôtes tiers, on les écarte avant httpx #2 et surtout avant nuclei.
+    total = apply_scope(scope_filter, final_file, "all_urls")
 
     # --- Passe httpx #2 : valider la carte crawlée --------------------------- #
     # katana découvre des URLs par crawl mais ne connaît PAS leur code HTTP.
@@ -1049,14 +1044,16 @@ def main(
     if revalidate and not skip_katana and not skip_httpx and httpx_path and total:
         stage_header("5b", "httpx #2", "validation de la carte crawlée (codes réels)")
         announce_eta("httpx", total, rate_limit, f"requêtes @ {rate_limit}/s (plancher)")
-        total_v, alive_v, elapsed = stage_httpx(
+        total_v, alive_v, live_v, elapsed = stage_httpx(
             httpx_path, final_file, httpx2_jsonl_file,
-            urls_all_final_file, urls_200_final_file,
-            match_codes, threads, rate_limit,
+            urls_all_final_file, urls_200_final_file, urls_live_final_file,
+            match_codes, threads, rate_limit, live_code_set,
         )
         report(total_v, urls_all_final_file, elapsed)
         console.print(f"  [green]→ {alive_v} en 200[/green] · {urls_200_final_file.name}")
+        console.print(f"  [green]→ {live_v} vivants ({live_codes})[/green] · {urls_live_final_file.name}")
         summary.append(("httpx #2", total_v, elapsed))
+        live_urls_files.insert(0, urls_live_final_file)  # la liste la plus à jour passe en tête
         live_all_file, live_200_file = urls_all_final_file, urls_200_final_file
 
     if tree_report and live_200_file.exists() and count_lines(live_200_file):
@@ -1067,6 +1064,8 @@ def main(
     console.print(f"  🗺️  [dim]carte[/dim]            [bold]{final_file}[/bold] [dim]({total} URLs)[/dim]")
     console.print(f"  📊 [dim]surface vivante[/dim]  [bold]{live_all_file}[/bold]")
     console.print(f"  🎯 [dim]endpoints 200[/dim]    [bold]{live_200_file}[/bold]")
+    if live_urls_files:
+        console.print(f"  🟢 [dim]liste live[/dim]       [bold]{live_urls_files[0]}[/bold] [dim](katana/nuclei)[/dim]")
     if tree_html_file.exists():
         console.print(f"  🌳 [dim]arbre HTML[/dim]       [bold]{tree_html_file}[/bold]")
 
@@ -1075,17 +1074,28 @@ def main(
             console.print("[bold red]nuclei introuvable dans le PATH.[/bold red]")
             raise typer.Exit(code=1)
 
-        # Cibles = surface VIVANTE validée (après httpx #2 si disponible), jamais
-        # le dump urlfinder brut : les URLs mortes rendaient nuclei interminable.
-        live_urls = clean_live_urls(live_all_file, final_file)
-        if scope_apexes:
-            live_urls = scope_urls(live_urls, scope_apexes)
+        # Cibles = liste LIVE validée (httpx #2 si disponible, sinon #1), jamais le
+        # dump urlfinder brut ni les 404/5xx de --match-codes. Repli sur l'ancien
+        # chemin seulement si httpx n'a pas tourné (--skip-httpx).
+        live_urls: List[str] = []
+        for candidate in live_urls_files:
+            live_urls = [u for u in read_lines(candidate) if u.startswith(("http://", "https://"))]
+            if live_urls:
+                break
+        if not live_urls and not live_urls_files:
+            live_urls = clean_live_urls(live_all_file, final_file)
+        before = len(live_urls)
+        live_urls = scope_filter.filter(live_urls, "nuclei")
+        if before != len(live_urls):
+            console.print(
+                f"  [dim]scope : {before - len(live_urls)} hors périmètre écartés ({rejected_scope_file.name})[/dim]"
+            )
         hosts = dedupe_hosts(live_urls)
 
         # hosts (défaut) vs urls : flag au départ, sinon demandé ici si terminal.
         targets_mode = nuclei_targets
         if targets_mode is None:
-            if sys.stdin.isatty():
+            if sys.stdin.isatty() and not yes:
                 choice = typer.prompt(
                     f"nuclei — cibles ? [1] hôtes vivants ({len(hosts)}) · [2] toutes les URLs vivantes ({len(live_urls)})",
                     default="1",
@@ -1099,11 +1109,11 @@ def main(
         if not count_in:
             console.print("[yellow]Aucune cible vivante pour nuclei — étape ignorée.[/yellow]")
         else:
-            if not scope_apexes:
+            if not scope_enabled:
                 console.print(
                     "[yellow]Rappel :[/yellow] payloads actifs sur [bold]"
-                    f"{count_in}[/bold] cibles, domaines tiers d'archive possibles. "
-                    "Restreins avec [cyan]--in-scope[/cyan]."
+                    f"{count_in}[/bold] cibles avec [cyan]--no-scope-filter[/cyan] : "
+                    "domaines tiers d'archive possibles."
                 )
             stage_header("6/6", "nuclei", f"mode {nuclei_mode} · {targets_mode} ({count_in} cibles)")
             console.print(f"  [dim]sévérité {nuclei_severity} · -mhe {nuclei_max_host_error} · -timeout {nuclei_timeout}s[/dim]")
@@ -1114,6 +1124,13 @@ def main(
             )
             report(n, nuclei_file, elapsed)
             summary.append(("nuclei", n, elapsed))
+
+    if scope_filter.total_rejected:
+        by_stage = ", ".join(f"{stage} {n}" for stage, n in scope_filter.rejected.items() if n)
+        console.print(
+            f"\n[dim]scope : {scope_filter.total_rejected} entrées hors périmètre écartées au total "
+            f"({by_stage}) → {rejected_scope_file}[/dim]"
+        )
 
     print_summary(summary, time.monotonic() - pipeline_start)
 

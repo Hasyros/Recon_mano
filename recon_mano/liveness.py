@@ -1,0 +1,103 @@
+"""Filtre de « vivacité » : quelles URLs méritent katana / nuclei.
+
+`--match-codes` (httpx -mc) reste large (500/502/503 compris) pour le triage
+manuel. Mais un 404 ou un 502 n'est pas une cible : katana n'a rien à crawler,
+nuclei y perdrait des requêtes. On extrait donc de la sortie httpx une liste
+« live » restreinte à `--live-codes`.
+
+httpx n'écrit jamais les timeouts / connexions refusées : ils sont absents de la
+sortie, donc forcément absents de la liste live.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+from .io_utils import count_lines, read_lines, write_lines
+
+# Codes qui prouvent qu'un endpoint répond pour de bon : 200, redirections, et
+# 401/403 (protégé = existe). 404 et 5xx en sont volontairement exclus.
+DEFAULT_LIVE_CODES = "200,301,302,307,308,401,403"
+
+
+def parse_codes(spec: str) -> Set[int]:
+    """`"200, 301 403"` → {200, 301, 403}. Lève ValueError sur un token non numérique."""
+    codes: Set[int] = set()
+    for token in spec.replace(",", " ").split():
+        codes.add(int(token))
+    return codes
+
+
+def iter_httpx_rows(lines: Iterable[str]) -> Iterator[Dict[str, Any]]:
+    """Lignes JSONL httpx → dicts. Les lignes cassées ou non-objets sont ignorées."""
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            yield row
+
+
+def filter_live(rows: Iterable[Dict[str, Any]], live_codes: Set[int]) -> List[str]:
+    """URLs nues (dédupliquées, ordre conservé) dont le code HTTP est dans `live_codes`."""
+    live: List[str] = []
+    for row in rows:
+        url = row.get("url") or row.get("input")
+        if url and row.get("status_code") in live_codes:
+            live.append(url)
+    return list(dict.fromkeys(live))
+
+
+def split_httpx_output(
+    jsonl_file: Path,
+    all_file: Path,
+    ok_file: Path,
+    live_file: Optional[Path] = None,
+    live_codes: Optional[Set[int]] = None,
+) -> Tuple[int, int, int]:
+    """Éclate la sortie JSONL de httpx. Retourne (total, alive_200, live).
+
+    - all_file  : une ligne annotée par résultat (`url [code] [taille] [titre] [tech]`)
+    - ok_file   : URLs nues en 200 uniquement
+    - live_file : URLs nues dont le code est dans `live_codes` (défaut DEFAULT_LIVE_CODES)
+    """
+    if live_codes is None:
+        live_codes = parse_codes(DEFAULT_LIVE_CODES)
+    rows = list(iter_httpx_rows(read_lines(jsonl_file)))
+
+    annotated: List[str] = []
+    alive: List[str] = []
+    for row in rows:
+        url = row.get("url") or row.get("input")
+        if not url:
+            continue
+        status = row.get("status_code")
+        parts = [url, f"[{status if status is not None else '-'}]"]
+        if row.get("content_length") is not None:
+            parts.append(f"[{row['content_length']}]")
+        title = (row.get("title") or "").replace("\n", " ").strip()
+        if title:
+            parts.append(f"[{title}]")
+        tech = row.get("tech") or []
+        if tech:
+            parts.append(f"[{','.join(tech)}]")
+        annotated.append(" ".join(parts))
+        if status == 200:
+            alive.append(url)
+
+    live = filter_live(rows, live_codes)
+    live_count = write_lines(live_file, live) if live_file is not None else len(live)
+    return write_lines(all_file, annotated), write_lines(ok_file, alive), live_count
+
+
+def clean_live_urls(urls_all_file: Path, fallback_file: Path) -> List[str]:
+    """URLs vivantes propres. urls_all.txt est annoté (`url [code] [titre]…`) :
+    on ne garde que le 1er token (l'URL). Repli sur la carte finale si absent."""
+    if urls_all_file.exists() and count_lines(urls_all_file):
+        raw = [line.split()[0] for line in read_lines(urls_all_file)]
+    else:
+        raw = read_lines(fallback_file)
+    return [u for u in raw if u.startswith(("http://", "https://"))]

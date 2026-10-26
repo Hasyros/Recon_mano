@@ -57,11 +57,14 @@ avec des milliers d'URLs mortes.
 | `04_httpx_input.txt` | Fusion des deux branches (entrée httpx) |
 | `05_httpx.jsonl` | Sortie httpx brute |
 | `urls_all.txt` / `urls_200.txt` | Surface vivante annotée / 200 — **avant** crawl |
+| `urls_live.txt` | URLs nues dont le code est dans `--live-codes` — **seeds de katana** |
 | `06_katana.txt` | Crawl actif (URLs découvertes, sans code HTTP) |
 | `all_urls.txt` | Carte brute (seeds + crawl, non revalidée) |
 | `08_httpx2.jsonl` | httpx #2 brut (revalidation de la carte) |
 | **`urls_all_final.txt`** | **Triage manuel** — surface vivante complète, annotée (archives + katana) |
 | **`urls_200_final.txt`** | **Tous les endpoints 200** (archives + katana) |
+| `urls_live_final.txt` | Liste live après httpx #2 — **cibles de nuclei** |
+| `rejected_scope.tsv` | Entrées écartées par le filtre de périmètre (`étape<TAB>hôte<TAB>ligne`), remis à zéro à chaque run |
 | `07_nuclei_input.txt` | Cibles réellement envoyées à nuclei |
 | `nuclei.txt` | Findings nuclei (avec `--nuclei`) |
 | **`urls_tree.html`** | **Arbre interactif repliable des 200** (à ouvrir au navigateur) |
@@ -159,7 +162,8 @@ Options utiles :
 | `--all-sources` | `subfinder -all` (plus lent, plus complet) |
 | `--subdomains` | Sous-domaines déjà connus (fichier ou liste virgulée, ex: trouvés via `ffuf`) : ignore l'étape subfinder et part directement de cette liste |
 | `--no-wildcard-filter` | Désactive `dnsx -wd` |
-| `--match-codes` | Codes retenus par httpx (défaut : large, 401/403/500 compris) |
+| `--match-codes` | Codes retenus par httpx (défaut : large, 401/403/500 compris) — pilote les fichiers de triage |
+| `--live-codes` | Codes jugés « vivants » (défaut `200,301,302,307,308,401,403`) : seules ces URLs alimentent katana et nuclei, jamais les 404/5xx |
 | `--depth` | Profondeur katana (défaut 2 — les seeds sont déjà profondes) |
 | `--scope` | `katana -fs` : `rdn` (défaut), `fqdn`, `dn` ou regex |
 | `--js-crawl` | `katana -jc` — endpoints lus dans le JS, **non requêtés donc non validés** |
@@ -171,8 +175,11 @@ Options utiles :
 | `--rate-limit` | Requêtes/seconde (défaut 150) |
 | `--revalidate` / `--no-revalidate` | Passe httpx #2 sur la carte katana → `urls_200_final.txt` (tous les 200). Défaut on |
 | `--tree` / `--no-tree` | Génère `urls_tree.html` (arbre interactif des 200). Défaut on |
-| `--in-scope` | Restreindre à ces domaines (liste virgulée, ex: `devinci.fr,esilv.fr`). Vide = tout garder |
-| `--nuclei` | Lance nuclei sur les hôtes/URLs **vivants** |
+| `--in-scope` | Domaines **ajoutés à la cible** dans le périmètre (liste virgulée, ex: `devinci.fr,esilv.fr`). Sans lui, la question est posée au lancement (terminal) |
+| `--exclude` | Hôtes/domaines hors périmètre (liste virgulée) : égaux ou sous-domaines d'une entrée |
+| `--no-scope-filter` | Désactive le filtre de périmètre (comportement historique : tout est gardé) |
+| `-y`, `--yes` | Ne pose aucune question (périmètre = cible + `--in-scope`, cibles nuclei = hôtes) |
+| `-n`, `--nuclei` | Lance nuclei sur les hôtes/URLs **vivants** (désactivé par défaut) |
 | `--nuclei-mode` | `auto` (`-as` tech-aware, défaut) · `curated` · `full` |
 | `--nuclei-targets` | `hosts` (défaut) · `urls` — sinon demandé dans un terminal |
 | `--nuclei-severity` / `--nuclei-rate-limit` / `--nuclei-max-host-error` | Sévérités · débit · abandon hôte (défaut `medium,high,critical` / 150 / 10) |
@@ -182,8 +189,13 @@ Options utiles :
 Exemple complet :
 
 ```bash
-recon_mano exemple.com sortie --clean --nuclei
+recon_mano exemple.com sortie --clean -n
 ```
+
+Le **périmètre** est appliqué strictement après chaque étape (subfinder, dnsx,
+urlfinder, katana, carte finale, cibles nuclei) : un hôte doit être la cible, un
+domaine de `--in-scope` ou un de leurs sous-domaines, et ne pas être dans
+`--exclude`. Ce qui est écarté est journalisé dans `rejected_scope.tsv`.
 
 Régénérer l'arbre HTML interactif d'un scan existant, avec la sous-commande
 `report` (sur un **dossier** : prend la meilleure liste de 200 ; sur un
