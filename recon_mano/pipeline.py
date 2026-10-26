@@ -57,7 +57,14 @@ ARTIFACTS: Dict[str, str] = {
     "urls_200_final": "urls_200_final.txt",
     "urls_live_final": "urls_live_final.txt",
     "rejected_scope": "rejected_scope.tsv",
-    "nuclei_input": "07_nuclei_input.txt",
+    "nuclei1_input": "07_nuclei1_input.txt",
+    "nuclei1_normal": "07_nuclei1_input_normal.txt",
+    "nuclei1_waf": "07_nuclei1_input_waf.txt",
+    "nuclei1_jsonl": "nuclei_pass1.jsonl",
+    "nuclei2_input": "07_nuclei2_input.txt",
+    "nuclei2_params": "07_nuclei2_params.txt",
+    "nuclei2_priority": "07_nuclei2_priority.txt",
+    "nuclei2_jsonl": "nuclei_pass2.jsonl",
     "nuclei": "nuclei.txt",
     "tree_html": "urls_tree.html",
     "run_config": "run_config.json",
@@ -346,7 +353,7 @@ class Scheduler:
             key=lambda r: (r.start is None, r.start if r.start is not None else 0.0, order[r.name]),
         )
         return [
-            ui.ModuleRow(r.name, r.label, r.icon, r.status.value, r.count, r.duration, r.rate, r.note)
+            ui.ModuleRow(r.name, r.label, r.icon, r.status.value, r.count, r.duration, r.rate, r.note, r.start)
             for r in recs
         ]
 

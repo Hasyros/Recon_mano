@@ -1,7 +1,8 @@
 # Recon Mano
 
 Pipeline Python de découverte et reconnaissance de sous-domaines, orchestrant
-`subfinder`, `dnsx`, `urlfinder`, `httpx`, `katana` et (en option) `nuclei`.
+`subfinder`, `dnsx`, `urlfinder`, `httpx`, `katana` et (en option) `nuclei`
+en deux passes.
 
 > À n'utiliser que sur des cibles pour lesquelles tu disposes d'une autorisation
 > explicite : programme de bug bounty dans son périmètre, mission de pentest, ou
@@ -19,6 +20,7 @@ cible ─┬─ subfinder → dnsx (-wd) ── hôtes ──┐
                                      urls_200_final.txt · urls_tree.html
                                                      │
                                                [--nuclei] (opt-in)
+                              (passe 1 par hôte ‖ katana · passe 2 par URL en fin de run)
 ```
 
 Les étapes s'exécutent en parallèle quand leurs dépendances le permettent (voir
@@ -58,9 +60,9 @@ ignorées ou désactivées — c'est le module qui gère ses entrées manquantes
 replis). Deux modules sans lien de dépendance tournent en même temps :
 
 ```
-subfinder ── dnsx ──┐
-                    ├─ httpx ── katana ── merge_map ── httpx #2 ─┬─ tree
-urlfinder ──────────┘                                            └─ nuclei (opt-in)
+subfinder ── dnsx ──┐          ┌─ katana ── merge_map ── httpx #2 ─┬─ tree
+                    ├─ httpx ──┤                                   └─ nuclei #2 (opt-in)
+urlfinder ──────────┘          └─ nuclei #1 (opt-in, ‖ katana)
 ```
 
 | Module | Dépend de | Rôle |
@@ -69,18 +71,20 @@ urlfinder ──────────┘                                     
 | `dnsx` | subfinder | Résolution DNS, wildcards filtrés |
 | `urlfinder` | — | Archives, depuis l'apex seul : tourne **en parallèle** de subfinder + dnsx |
 | `httpx` | dnsx, urlfinder | Fusion des hôtes et des URLs d'archive, une passe |
+| `nuclei1` | httpx | Opt-in (`-n`) : nuclei **par hôte**, pendant le crawl katana (voir [nuclei en deux passes](#nuclei-en-deux-passes)) |
 | `katana` | httpx | Crawl des seeds vivantes |
 | `merge_map` | katana | `all_urls.txt` = seeds vivantes + crawl, périmètre strict (léger, sans réseau) |
 | `httpx2` | merge_map | Revalidation de la carte |
 | `tree` | httpx2 | `urls_tree.html` |
-| `nuclei` | httpx2 | Opt-in (`-n`) |
+| `nuclei2` | httpx2 | Opt-in (`-n`) : nuclei **par URL représentative** (DAST + exposition), fin de pipeline |
 
 - **`--workers N`** (défaut 4) : nombre maximum de modules simultanés.
   **`--sequential`** = `--workers 1` (un seul module à la fois, ordre historique) —
   pratique pour déboguer ou comparer.
-- **`--max-rps N`** (défaut 150) : budget de débit **global**. `--rate-limit` et
-  `--nuclei-rate-limit` ne sont plus que des débits *demandés* ; la somme des débits
-  accordés aux modules qui frappent la cible (httpx, katana, nuclei) ne dépasse
+- **`--max-rps N`** (défaut 150) : budget de débit **global**. `--rate-limit`,
+  `--nuclei-rate-limit` et `--nuclei2-rate-limit` ne sont plus que des débits
+  *demandés* ; la somme des débits accordés aux modules qui frappent la cible
+  (httpx, katana, nuclei #1, nuclei #2) ne dépasse
   jamais `--max-rps`. Le budget est global parce que c'est la cible qui encaisse
   le trafic cumulé, pas chaque outil : deux modules à 150 req/s en parallèle font
   300 req/s côté serveur, ce qui déclenche WAF et bans. Un module reçoit
@@ -98,14 +102,15 @@ urlfinder ──────────┘                                     
 - **katana ne crawle que du confirmé vivant** : si httpx n'a trouvé aucune URL
   vivante, katana est *ignoré* (jamais de crawl de cibles non confirmées). Le repli
   sur les entrées brutes fusionnées n'existe que pour `--skip-httpx`.
-- **Aucune question pendant l'exécution** : périmètre et cibles nuclei
-  (`hôtes vivants` / `toutes les URLs vivantes`) sont demandés au lancement ;
-  `-y`, `--in-scope` et `--nuclei-targets` évitent les questions, hors terminal
-  les cibles nuclei valent « hôtes ».
+- **Aucune question pendant l'exécution** : seul le périmètre est demandé, au
+  lancement ; `-y` et `--in-scope` évitent la question. (nuclei ne pose plus de
+  question : la passe 1 est par hôte, la passe 2 par URL, voir plus bas.)
 - **Affichage** : un board live (une ligne par module : état, lignes écrites, temps,
   débit accordé) ; chaque module imprime son bloc de détails à sa fin, puis un
   récapitulatif final avec une ligne par module (✓ terminé · ✗ échec · ⏱ timeout ·
-  – ignoré · ⊘ désactivé) et la durée réelle face au cumul des modules. Avec `-v`,
+  – ignoré · ⊘ désactivé), le **début** de chaque module (décalage depuis le lancement :
+  on y voit nuclei #1 démarrer pendant le crawl katana) et la durée réelle face au
+  cumul des modules. Avec `-v`,
   pas de board : flux des outils préfixé `outil │` et heartbeat.
 - **`run_stats.json`** : par module, statut, début/fin (décalage en s), durée,
   résultat, débit accordé, note ; plus `wall_clock` (durée réelle),
@@ -145,10 +150,14 @@ sous l'étape `merge`.
 | `08_httpx2.jsonl` | httpx #2 brut (revalidation de la carte) |
 | **`urls_all_final.txt`** | **Triage manuel** — surface vivante complète, annotée (archives + katana) |
 | **`urls_200_final.txt`** | **Tous les endpoints 200** (archives + katana) |
-| `urls_live_final.txt` | Liste live après httpx #2 — **cibles de nuclei** |
+| `urls_live_final.txt` | Liste live après httpx #2 — **source de la passe 2 de nuclei** (la passe 1 part de `urls_live.txt`) |
 | `rejected_scope.tsv` | Entrées écartées par le filtre de périmètre (`étape<TAB>hôte<TAB>ligne`), remis à zéro à chaque run |
-| `07_nuclei_input.txt` | Cibles réellement envoyées à nuclei |
-| `nuclei.txt` | Findings nuclei (avec `--nuclei`) |
+| `07_nuclei1_input.txt` | Passe 1 : hôtes (`scheme://hôte[:port]`) envoyés à nuclei (+ `07_nuclei1_input_normal.txt` / `_waf.txt` si des hôtes sont derrière un WAF/CDN) |
+| `07_nuclei2_input.txt` | Passe 2 : URLs représentantes (K par signature, statiques exclues) |
+| `07_nuclei2_params.txt` | Passe 2 : représentantes avec paramètres → run DAST |
+| `07_nuclei2_priority.txt` | Passe 2 : représentantes prioritaires → run exposition |
+| `nuclei_pass1.jsonl` / `nuclei_pass2.jsonl` | Findings bruts de chaque passe (JSONL, une ligne = un finding) — source de vérité |
+| `nuclei.txt` | Vue lisible fusionnée des deux passes : `[sévérité] template-id URL`, triée du plus grave au moins grave |
 | **`urls_tree.html`** | **Arbre interactif repliable des 200** (à ouvrir au navigateur) |
 | `run_config.json` | Config du run (cible, périmètre, codes, modules) — relue par `recon_mano merge` |
 | `run_stats.json` | Statut, durées et débit par module ; `wall_clock`, `sum_of_durations`, `parallel_gain` |
@@ -179,6 +188,7 @@ go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest   # optionnel
+go install github.com/tomnomnom/gf@latest                              # optionnel (passe 2 de nuclei)
 ```
 
 > **Piège `httpx`.** Le client HTTP Python s'installe aussi sous le nom `httpx`
@@ -259,7 +269,7 @@ Options utiles :
 | `--urlfinder-retries` | Réessais si urlfinder rend 0 (défaut 1) |
 | `--urlfinder-retry-wait` | Base du délai entre essais urlfinder, en s, progressif ×n (défaut 30) |
 | `--rate-limit` | Requêtes/seconde demandées par httpx et katana (défaut 150), plafonnées par `--max-rps` |
-| `--max-rps` | Budget de débit **global** en req/s partagé par httpx, katana et nuclei (défaut 150) — voir [Exécution parallèle](#exécution-parallèle) |
+| `--max-rps` | Budget de débit **global** en req/s partagé par httpx, katana et nuclei #1/#2 (défaut 150) — voir [Exécution parallèle](#exécution-parallèle) |
 | `--workers` | Modules exécutés en parallèle au maximum (défaut 4) |
 | `--sequential` | Un module à la fois (= `--workers 1`), pour déboguer ou comparer |
 | `--revalidate` / `--no-revalidate` | Passe httpx #2 sur la carte katana → `urls_200_final.txt` (tous les 200). Défaut on |
@@ -267,12 +277,19 @@ Options utiles :
 | `--in-scope` | Domaines **ajoutés à la cible** dans le périmètre (liste virgulée, ex: `devinci.fr,esilv.fr`). Sans lui, la question est posée au lancement (terminal) |
 | `--exclude` | Hôtes/domaines hors périmètre (liste virgulée) : égaux ou sous-domaines d'une entrée |
 | `--no-scope-filter` | Désactive le filtre de périmètre (comportement historique : tout est gardé) |
-| `-y`, `--yes` | Ne pose aucune question au lancement (périmètre = cible + `--in-scope`, cibles nuclei = hôtes) |
-| `-n`, `--nuclei` | Lance nuclei sur les hôtes/URLs **vivants** (désactivé par défaut) |
-| `--nuclei-mode` | `auto` (`-as` tech-aware, défaut) · `curated` · `full` |
-| `--nuclei-targets` | `hosts` (défaut) · `urls` — sinon demandé **au lancement** dans un terminal |
-| `--nuclei-severity` / `--nuclei-rate-limit` / `--nuclei-max-host-error` | Sévérités · débit demandé (plafonné par `--max-rps`) · abandon hôte (défaut `medium,high,critical` / 150 / 10) |
-| `--nuclei-timeout` / `--nuclei-concurrency` / `--nuclei-retries` | Vitesse : timeout par requête · templates parallèles · retries (défaut 5 / 25 / 1) |
+| `-y`, `--yes` | Ne pose aucune question au lancement (périmètre = cible + `--in-scope`) |
+| `-n`, `--nuclei` | Lance nuclei en deux passes sur les hôtes/URLs **vivants** — **opt-in strict**, désactivé par défaut |
+| `--nuclei-passes` | `1` (par hôte) · `2` (par URL représentante) · `1,2` (défaut). Prioritaire sur `--nuclei-targets` |
+| `--nuclei-targets` | Compatibilité : `hosts` → passe 1 seule · `urls` → les deux passes (défaut si absent). Plus aucune question au lancement |
+| `--nuclei-mode` | Templates de la passe 1 : `auto` (`-as` tech-aware, défaut) · `curated` · `full` |
+| `--nuclei-severity` | Sévérités de la passe 1 et du run DAST de la passe 2 (défaut `medium,high,critical`) ; le run exposition de la passe 2 n'est pas filtré |
+| `--nuclei-rate-limit` | Débit **demandé** de la passe 1 (défaut **50**, plafonné par `--max-rps`) : elle partage le budget avec katana |
+| `--nuclei2-rate-limit` | Débit demandé de la passe 2 (défaut **150**, plafonné par `--max-rps`) : elle tourne en fin de pipeline, presque seule |
+| `--nuclei-waf-factor` | Passe 1 : débit des hôtes derrière un WAF/CDN = débit accordé × ce facteur (défaut 0.3, entre 0.01 et 1) |
+| `--nuclei-k` | Passe 2 : URLs gardées par signature (défaut 2) |
+| `--nuclei-priority` / `--no-nuclei-priority` | Passe 2 : run exposition/misconfig sur les chemins sensibles (défaut on) |
+| `--nuclei-max-host-error` | nuclei `-mhe` : abandon d'un hôte après N erreurs, les deux passes (défaut 10) |
+| `--nuclei-timeout` / `--nuclei-concurrency` / `--nuclei-retries` | Vitesse : timeout par requête · templates parallèles · retries, les deux passes (défaut 5 / 25 / 1) |
 | `--skip-*` | `dnsx`, `urlfinder`, `httpx`, `katana` — le module est ignoré, l'aval retombe sur l'étape précédente |
 
 Exemple complet :
@@ -304,7 +321,81 @@ recon_mano merge sortie
 ```
 
 `nuclei` est désactivé par défaut : c'est la seule étape qui envoie des
-payloads, elle ne doit jamais partir sans geste explicite.
+payloads, elle ne doit jamais partir sans geste explicite (`-n`). Sans `-n`,
+ni la passe 1 ni la passe 2 n'existent : le pipeline se comporte exactement comme
+sans nuclei (même commande httpx, katana garde tout le budget, aucun fichier nuclei).
+
+### nuclei en deux passes
+
+nuclei est une **attaque** (templates actifs, payloads). Il ne démarre donc que
+sur `-n`, uniquement sur des cibles **confirmées vivantes** (`--live-codes`) et
+**dans le périmètre** (filtre appliqué aux étapes `nuclei1` et `nuclei2`, rejets
+dans `rejected_scope.tsv`). Il tourne en deux passes aux rôles distincts :
+
+| | Passe 1 — `nuclei #1` | Passe 2 — `nuclei #2` |
+|---|---|---|
+| Granularité | par **hôte** (`scheme://hôte[:port]`, sans chemin) | par **URL représentante** |
+| Quand | dès qu'httpx #1 a confirmé les hôtes, **pendant** le crawl katana | en fin de pipeline, après httpx #2 |
+| Source | `urls_live.txt` | `urls_live_final.txt` (repli : `urls_live.txt`) |
+| Templates | `--nuclei-mode` (`auto` = `-as`) + `-etags fuzz,dos,intrusive`, jamais `-dast` | run A : `-dast` · run B : `-tags exposure,misconfig` |
+| Sévérité | `--nuclei-severity` | A : `--nuclei-severity` · B : aucun filtre |
+| Débit demandé | `--nuclei-rate-limit` (**50**) | `--nuclei2-rate-limit` (**150**) |
+| Sortie | `nuclei_pass1.jsonl` | `nuclei_pass2.jsonl` |
+
+`--nuclei-passes 1`, `2` ou `1,2` choisit les passes (`--nuclei-targets hosts` =
+passe 1 seule, `urls` = les deux, conservé pour compatibilité ; `--nuclei-passes`
+l'emporte). Les deux passes passent par le budget global `--max-rps`.
+
+**Pourquoi 50 pour la passe 1.** Elle tourne en même temps que katana, et le budget
+est partagé. Dans la liste des modules `nuclei1` est déclaré *avant* `katana` : quand
+les deux deviennent prêts dans le même tour, nuclei obtient d'abord ses 50 req/s et
+katana reçoit le reste — avec `--max-rps 150` : nuclei 50 + katana 100. La passe 2
+tourne presque seule, d'où 150. (Un même hôte sur deux ports = deux cibles.)
+
+**WAF / CDN.** Quand nuclei est actif, httpx #1 est lancé avec `-cdn` (sans `-n`, sa
+commande ne change pas) et ajoute `cdn`, `cdn_name`, `cdn_type` à son JSONL. Les
+hôtes derrière un WAF/CDN (`cdn_type` `waf` ou `cdn`) sont scannés dans un **second
+lot, après les autres**, aux mêmes templates mais à `max(1, int(débit accordé ×
+--nuclei-waf-factor))` (0.3 par défaut) : un débit bas derrière un WAF évite bans et
+bruit. Un simple hébergement cloud (`cdn_type: cloud`) compte comme hôte normal.
+
+**Signatures et K (passe 2).** Tester `/produit/1` … `/produit/9000` n'apprend rien
+de plus que d'en tester deux. Les URLs vivantes non statiques (images, CSS, JS,
+polices, médias, archives, pdf/bureautique exclus) sont groupées par **signature** :
+`hôte[:port]` + chemin dont les segments variables sont remplacés (`{n}` nombre,
+`{uuid}`, `{hash}` hex ≥ 16, `{date}` ISO, `{tok}` jeton aléatoire ≥ 24) + noms de
+paramètres triés sans valeurs (`?a&b`). On garde les **K premières** de chaque
+signature (`--nuclei-k`, défaut 2), ordre conservé. Le schéma est ignoré
+(`http`/`https` = même appli) mais le port est gardé. Le résultat est écrit dans
+`07_nuclei2_input.txt`.
+
+**Les deux runs de la passe 2.**
+
+- **A — DAST** : `nuclei -dast` sur les représentantes **avec paramètres**
+  (`07_nuclei2_params.txt`), sévérité `--nuclei-severity`, `-etags dos,intrusive`.
+  Ignoré avec une note s'il n'y en a pas.
+- **B — exposition** : `-tags exposure,misconfig` sur la **liste prioritaire**
+  (`07_nuclei2_priority.txt`), **sans filtre de sévérité** (les fichiers exposés
+  « info/low » — `.env`, `.git`, phpinfo — sont justement la cible), `-etags
+  dos,intrusive`. Désactivable : `--no-nuclei-priority`.
+
+**Liste prioritaire.** Une représentante est prioritaire si son **chemin** contient
+un mot `admin`, `api`, `upload`, `config`, `debug`, `graphql`, `swagger`,
+`actuator`, `internal` ou `backup` (casse ignorée). Le chemin est découpé en mots
+(`/`, `-`, `_`, `.`…) : un mot court (`api`) doit être exact (ou `apis`, `apiv2`), un
+mot long accepte un préfixe (`administrator`, `uploads`, `configuration`) — une
+simple sous-chaîne matcherait `/capital-markets`. Si [`gf`](https://github.com/tomnomnom/gf)
+est installé (optionnel), on y ajoute les URLs que `gf xss|sqli|ssrf|redirect|lfi|rce|idor`
+reconnaît (motifs absents de `~/.gf` ignorés). Sans `gf`, repli sur une liste interne
+de noms de paramètres suspects (`id`, `url`, `redirect`, `next`, `file`, `path`,
+`page`, `q`, `search`, `cmd`, `exec`, `callback`, `return`, `dest`, `template`,
+`include`…).
+
+**Sorties.** Chaque passe écrit son JSONL ; à la fin du run, `nuclei.txt` en est la
+vue lisible fusionnée (`[sévérité] template-id URL`, du plus grave au moins grave,
+dédoublonnée) et une ligne de synthèse donne le décompte par sévérité. Seules les
+passes terminées dans **ce** run alimentent `nuclei.txt` : un JSONL périmé d'un
+run précédent est ignoré.
 
 ### urlfinder qui rend 0
 

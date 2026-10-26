@@ -61,6 +61,7 @@ def run_command(
     timeout: Optional[int] = None,
     stdout_to: Optional[Path] = None,
     silent: bool = True,
+    stdin_from: Optional[Path] = None,
 ) -> tuple[int, float, str]:
     """Lance un outil sans tuer le pipeline sur un exit code non nul.
 
@@ -71,6 +72,9 @@ def run_command(
 
     `stdout_to` redirige la sortie standard vers un fichier (au lieu de la jeter) :
     on capture ainsi directement ce que l'outil imprime, sans dépendre de son -o.
+
+    `stdin_from` alimente l'entrée standard depuis un fichier (outils de filtre type
+    `gf`) ; sans lui l'outil hérite de l'entrée du pipeline, comme avant.
 
     `timeout` (secondes) : l'outil est tué au-delà, code retour 124.
 
@@ -84,6 +88,7 @@ def run_command(
     start = time.monotonic()
     out_handle = open(stdout_to, "w", encoding="utf-8") if stdout_to is not None else None
     out_target = out_handle if out_handle is not None else subprocess.DEVNULL
+    in_handle = open(stdin_from, "rb") if stdin_from is not None else None
     proc: Optional[subprocess.Popen] = None
 
     try:
@@ -91,7 +96,7 @@ def run_command(
             console.print(f"[dim cyan]$ {' '.join(full)}[/dim cyan]")
         try:
             proc = subprocess.Popen(
-                full, stderr=subprocess.PIPE, stdout=out_target,
+                full, stderr=subprocess.PIPE, stdout=out_target, stdin=in_handle,
                 text=True, encoding="utf-8", errors="replace", bufsize=1 if _VERBOSE else -1,
             )
         except FileNotFoundError:
@@ -155,6 +160,8 @@ def run_command(
                 _PROCS.discard(proc)
         if out_handle is not None:
             out_handle.close()
+        if in_handle is not None:
+            in_handle.close()
 
     elapsed = time.monotonic() - start
     stderr_text = "".join(stderr_tail)

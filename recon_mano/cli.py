@@ -3,14 +3,16 @@
 Pipeline : des modules indépendants, lancés par un ordonnanceur dès que leurs
 dépendances sont terminées (voir `pipeline.py` et `modules.py`)::
 
-    cible ─┬─ subfinder ── dnsx ──┐
-           │                      ├─ httpx ── katana ── merge_map ── httpx #2 ─┬─ tree
-           └─ urlfinder ──────────┘                                            └─ nuclei (opt-in)
+    cible ─┬─ subfinder ── dnsx ──┐          ┌─ katana ── merge_map ── httpx #2 ─┬─ tree
+           │                      ├─ httpx ──┤                                   └─ nuclei #2 (opt-in)
+           └─ urlfinder ──────────┘          └─ nuclei #1 (opt-in, ‖ katana)
 
 subfinder et urlfinder n'ont aucune dépendance : ils tournent en parallèle.
 `--workers` borne les modules simultanés, `--max-rps` le débit total vers la cible
 (budget global partagé par httpx, katana et nuclei). Chaque run écrit
 `run_config.json` (périmètre, codes) et `run_stats.json` (durées par module).
+nuclei (`-n`, jamais par défaut) tourne en deux passes : par hôte pendant le crawl,
+puis par URL représentative en fin de pipeline.
 
 Invocation minimale::
 
@@ -40,6 +42,7 @@ from . import runner
 from .io_utils import count_lines
 from .liveness import DEFAULT_LIVE_CODES, parse_codes
 from .merge import merge_folder
+from .findings import severity_line
 from .modules import (  # noqa: F401 — ré-exportés pour compatibilité
     DEFAULT_MATCH_CODES,
     Options,
@@ -47,9 +50,11 @@ from .modules import (  # noqa: F401 — ré-exportés pour compatibilité
     build_modules,
     dedupe_hosts,
     final_lists,
+    finalize_nuclei,
     live_lists,
     load_provided_subdomains,
     merge_files,
+    resolve_nuclei_passes,
 )
 from .pipeline import ARTIFACTS, Context, Scheduler, build_paths, write_run_config
 from .report import write_report as write_tree_report
@@ -66,8 +71,11 @@ from .ui import (  # noqa: F401
 
 REQUIRED_TOOLS = ["subfinder", "dnsx", "httpx", "urlfinder", "katana"]
 
+# Anciens fichiers qu'un --clean doit aussi emporter (nuclei mono-passe, avant les deux passes).
+LEGACY_ARTIFACTS = ["07_nuclei_input.txt"]
+
 # Fichiers produits par le pipeline — sert au nettoyage (--clean).
-ARTIFACT_NAMES = list(ARTIFACTS.values())
+ARTIFACT_NAMES = list(ARTIFACTS.values()) + LEGACY_ARTIFACTS
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +131,12 @@ def check_tools() -> List[str]:
         f"[green]nuclei[/green] (optionnel) : {nuclei_path}"
         if nuclei_path
         else "[dim]nuclei (optionnel) introuvable — nécessaire seulement avec --nuclei[/dim]"
+    )
+    gf_path = shutil.which("gf")
+    console.print(
+        f"[green]gf[/green] (optionnel) : {gf_path}"
+        if gf_path
+        else "[dim]gf (optionnel) introuvable — repli sur une liste interne de paramètres suspects (passe 2 de nuclei)[/dim]"
     )
     return missing
 
@@ -254,20 +268,51 @@ def main(
     no_scope_filter: bool = typer.Option(
         False, "--no-scope-filter", help="Désactive tout filtrage de périmètre (comportement historique)"
     ),
-    yes: bool = typer.Option(False, "-y", "--yes", help="Ne pose aucune question (périmètre = cible + --in-scope, nuclei = hôtes)"),
-    nuclei: bool = typer.Option(False, "-n", "--nuclei", help="Lance nuclei sur les hôtes/URLs vivants"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Ne pose aucune question (périmètre = cible + --in-scope)"),
+    nuclei: bool = typer.Option(
+        False, "-n", "--nuclei",
+        help="Lance nuclei (opt-in, jamais par défaut) en deux passes : par hôte vivant (pendant le crawl katana) "
+             "puis par URL représentative (fin de pipeline).",
+    ),
     nuclei_mode: str = typer.Option(
         "auto", "--nuclei-mode",
         help="auto (-as tech-aware, défaut) | curated (tags CVE/expo/misconfig, sans fuzz) | full (tout selon --nuclei-severity)",
     ),
+    nuclei_passes: Optional[str] = typer.Option(
+        None, "--nuclei-passes",
+        help="Passes nuclei à lancer : 1 (par hôte), 2 (par URL représentative) ou 1,2 (défaut). Prioritaire sur --nuclei-targets.",
+    ),
     nuclei_targets: Optional[str] = typer.Option(
         None, "--nuclei-targets",
-        help="hosts (hôtes vivants dédupliqués, défaut) | urls (toutes les URLs vivantes). Absent + terminal → demandé au lancement.",
+        help="Compatibilité : hosts → passe 1 seule · urls → les deux passes (défaut si absent). Remplacé par --nuclei-passes.",
     ),
-    nuclei_severity: str = typer.Option("medium,high,critical", "--nuclei-severity"),
-    nuclei_rate_limit: int = typer.Option(150, "--nuclei-rate-limit", help="nuclei -rate-limit (plafonné par --max-rps)"),
+    nuclei_severity: str = typer.Option(
+        "medium,high,critical", "--nuclei-severity",
+        help="Sévérités nuclei de la passe 1 et du run DAST de la passe 2 (le run exposition de la passe 2 n'est pas filtré)",
+    ),
+    nuclei_rate_limit: int = typer.Option(
+        50, "--nuclei-rate-limit",
+        help="nuclei passe 1 : débit demandé (req/s, plafonné par --max-rps). 50 car la passe 1 partage le budget avec katana "
+             "(150 au total : nuclei 50 + katana 100).",
+    ),
+    nuclei2_rate_limit: int = typer.Option(
+        150, "--nuclei2-rate-limit",
+        help="nuclei passe 2 : débit demandé (req/s, plafonné par --max-rps). 150 car elle tourne en fin de pipeline, presque seule.",
+    ),
+    nuclei_waf_factor: float = typer.Option(
+        0.3, "--nuclei-waf-factor", min=0.01, max=1.0,
+        help="Passe 1 : les hôtes derrière un WAF/CDN (httpx -cdn) sont scannés après les autres à débit accordé × ce facteur (bans, bruit)",
+    ),
+    nuclei_k: int = typer.Option(
+        2, "--nuclei-k", min=1,
+        help="Passe 2 : nombre d'URLs gardées par signature (hôte + chemin templaté + noms de paramètres)",
+    ),
+    nuclei_priority: bool = typer.Option(
+        True, "--nuclei-priority/--no-nuclei-priority",
+        help="Passe 2 : run exposition/misconfig sur les chemins sensibles (admin, api, upload, config, debug…), sans filtre de sévérité",
+    ),
     nuclei_max_host_error: int = typer.Option(
-        10, "--nuclei-max-host-error", help="nuclei -mhe : abandonne un hôte après N erreurs (nuclei=30)"
+        10, "--nuclei-max-host-error", help="nuclei -mhe : abandonne un hôte après N erreurs (nuclei=30), les deux passes"
     ),
     nuclei_timeout: int = typer.Option(5, "--nuclei-timeout", help="nuclei -timeout (s) : ne pas s'attarder sur un hôte lent"),
     nuclei_concurrency: int = typer.Option(25, "--nuclei-concurrency", help="nuclei -c : templates en parallèle"),
@@ -283,7 +328,7 @@ def main(
     workers: int = typer.Option(4, "--workers", min=1, help="Nombre maximum de modules exécutés en parallèle"),
     sequential: bool = typer.Option(False, "--sequential", help="Un module à la fois (= --workers 1) : débogage / comparaison"),
 ):
-    """Recon Mano — subfinder ‖ urlfinder → dnsx → httpx → katana → httpx #2 → nuclei (opt-in).
+    """Recon Mano — subfinder ‖ urlfinder → dnsx → httpx → katana ‖ nuclei #1 → httpx #2 → nuclei #2 (opt-in).
 
     Exemple : recon_mano exemple.com sortie -n
     """
@@ -321,8 +366,10 @@ def main(
     if nuclei_mode not in {"auto", "curated", "full"}:
         console.print("[bold red]--nuclei-mode :[/bold red] auto | curated | full")
         raise typer.Exit(code=2)
-    if nuclei_targets is not None and nuclei_targets not in {"hosts", "urls"}:
-        console.print("[bold red]--nuclei-targets :[/bold red] hosts | urls")
+    try:
+        passes = resolve_nuclei_passes(nuclei_passes, nuclei_targets)
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=2)
 
     try:
@@ -346,15 +393,6 @@ def main(
         answer = typer.prompt("Domaines en scope (virgules)", default=target_apex)
         scope_apexes = parse_domains(str(answer)) or [target_apex]
 
-    # Cibles nuclei (hosts par défaut vs urls) : les comptes ne sont pas connus
-    # avant la fin du scan, donc question sans chiffres. Non-TTY → hôtes.
-    if nuclei and nuclei_targets is None:
-        if interactive:
-            choice = typer.prompt("nuclei — cibles ? [1] hôtes vivants · [2] toutes les URLs vivantes", default="1")
-            nuclei_targets = "urls" if str(choice).strip() == "2" else "hosts"
-        else:
-            nuclei_targets = "hosts"
-
     # Sortie par défaut = nom de la cible assaini.
     if output is None:
         output = Path(target.replace("/", "_").replace(":", "_"))
@@ -373,8 +411,10 @@ def main(
         urlfinder_retries=urlfinder_retries, urlfinder_retry_wait=urlfinder_retry_wait,
         threads=threads, rate_limit=rate_limit, concurrency=concurrency, httpx_bin=httpx_bin,
         revalidate=revalidate, tree_report=tree_report, scope_enabled=scope_enabled,
-        nuclei=nuclei, nuclei_mode=nuclei_mode, nuclei_targets=nuclei_targets or "hosts",
+        nuclei=nuclei, nuclei_mode=nuclei_mode, nuclei_passes=passes,
         nuclei_severity=nuclei_severity, nuclei_rate_limit=nuclei_rate_limit,
+        nuclei2_rate_limit=nuclei2_rate_limit, nuclei_waf_factor=nuclei_waf_factor,
+        nuclei_k=nuclei_k, nuclei_priority=nuclei_priority,
         nuclei_max_host_error=nuclei_max_host_error, nuclei_timeout=nuclei_timeout,
         nuclei_concurrency=nuclei_concurrency, nuclei_retries=nuclei_retries,
         skip_dnsx=skip_dnsx, skip_urlfinder=skip_urlfinder, skip_httpx=skip_httpx, skip_katana=skip_katana,
@@ -382,7 +422,7 @@ def main(
 
     scan_bits = []
     if nuclei:
-        scan_bits.append(f"nuclei {nuclei_mode}·{options.nuclei_targets}")
+        scan_bits.append(f"nuclei {nuclei_mode} · passe{'s' if ',' in passes else ''} {passes}")
     scan_bits.append(f"revalidate {'on' if revalidate else 'off'}")
     if scope_enabled:
         scan_bits.append(f"scope {','.join(scope_apexes)}")
@@ -421,6 +461,10 @@ def main(
         "live_codes": sorted(live_code_set),
         "match_codes": match_codes,
         "modules": [m.name for m in modules if m.enabled],
+        "nuclei": {
+            "enabled": nuclei, "passes": passes if nuclei else "", "mode": nuclei_mode, "k": nuclei_k,
+            "waf_factor": nuclei_waf_factor, "priority": nuclei_priority,
+        },
         "workers": workers,
         "max_rps": max_rps,
     })
@@ -454,6 +498,10 @@ def main(
 
     print_summary(scheduler.summary_rows(), scheduler.wall_clock, scheduler.sum_of_durations, scheduler.failed)
     console.print(f"[dim]stats par module → {paths['run_stats']}[/dim]")
+    if nuclei:
+        counts = finalize_nuclei(ctx)
+        if counts is not None:
+            console.print(f"[bold]nuclei[/bold] · {severity_line(counts)} [dim]→ {paths['nuclei']}[/dim]")
     if scheduler.failed:
         raise typer.Exit(code=1)
 

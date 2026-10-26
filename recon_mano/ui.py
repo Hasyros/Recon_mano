@@ -79,7 +79,7 @@ _BANNER_GRAD = ["#22d3ee", "#38bdf8", "#3b82f6", "#6366f1", "#818cf8"]
 STAGE_ICONS = {
     "subfinder": "🔍", "dnsx": "🧬", "urlfinder": "📜", "httpx": "📡",
     "httpx #2": "🔁", "httpx2": "🔁", "katana": "🧭", "nuclei": "💥", "report": "🌳",
-    "merge_map": "🧩", "tree": "🌳",
+    "nuclei1": "💥", "nuclei2": "💥", "merge_map": "🧩", "tree": "🌳",
 }
 
 # statut → (glyphe, style Rich, libellé)
@@ -181,6 +181,7 @@ class ModuleRow:
     elapsed: float = 0.0
     rate: int = 0
     note: str = ""
+    start: Optional[float] = None   # décalage (s) depuis le début du run
 
 
 class Board:
@@ -241,18 +242,21 @@ def print_summary(
         title_justify="left", expand=False, padding=(0, 1),
     )
     table.add_column("étape", no_wrap=True)
+    table.add_column("début", justify="right", style="dim", no_wrap=True)
     table.add_column("statut", no_wrap=True)
     table.add_column("résultat", justify="right", style="bold", no_wrap=True)
     table.add_column("temps", justify="right", style="dim", no_wrap=True)
     table.add_column("note", style="dim", no_wrap=True, overflow="ellipsis")
-    # Les colonnes fixes (~58 car. avec bordures) gardent leur largeur ; la note prend le reste.
-    note_width = min(max(console.width - 60, 16), 70)
+    # Les colonnes fixes (~66 car. avec bordures) gardent leur largeur ; la note prend le reste.
+    note_width = min(max(console.width - 68, 16), 70)
     for row in rows:
         glyph, style, label = STATUS_VIEW.get(row.status, ("•", "", row.status))
         has_result = row.status in ("done", "timeout", "failed")
         result = f"{row.count:,}".replace(",", " ") if has_result and row.status != "failed" else "–"
+        ran = row.status not in ("skipped", "disabled") and row.start is not None
         table.add_row(
             f"{row.icon} {row.label}",
+            f"+{human_duration(row.start)}" if ran else "",
             Text(f"{glyph} {label}", style=style),
             result,
             human_duration(row.elapsed) if row.status not in ("skipped", "disabled") else "",

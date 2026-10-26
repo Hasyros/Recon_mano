@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from .io_utils import count_lines, read_lines, write_lines
+from .signatures import host_port
 
 # Codes qui prouvent qu'un endpoint répond pour de bon : 200, redirections, et
 # 401/403 (protégé = existe). 404 et 5xx en sont volontairement exclus.
@@ -49,6 +50,30 @@ def filter_live(rows: Iterable[Dict[str, Any]], live_codes: Set[int]) -> List[st
         if url and row.get("status_code") in live_codes:
             live.append(url)
     return list(dict.fromkeys(live))
+
+
+def protected_hosts(jsonl_file: Path) -> Dict[str, str]:
+    """Hôtes derrière un WAF / CDN d'après la sortie httpx lancée avec `-cdn`.
+
+    httpx ajoute `cdn` (bool), `cdn_name` et `cdn_type` (« cdn », « waf », « cloud »…) à
+    chaque ligne. Un simple hébergement cloud (`cdn_type: cloud`) n'est pas un filtre
+    en frontal : on ne le compte pas. `cdn: true` sans `cdn_type` (ancien httpx) est
+    traité comme protégé — dans le doute on ralentit. Clé = `hôte[:port]` normalisé
+    (`signatures.host_port`), valeur = libellé lisible (« cloudflare (waf) »).
+    """
+    protected: Dict[str, str] = {}
+    for row in iter_httpx_rows(read_lines(jsonl_file)):
+        if not row.get("cdn"):
+            continue
+        kind = str(row.get("cdn_type") or "").lower()
+        if kind == "cloud":
+            continue
+        key = host_port(str(row.get("url") or row.get("input") or ""))
+        if not key:
+            continue
+        name = str(row.get("cdn_name") or "cdn")
+        protected.setdefault(key, f"{name} ({kind})" if kind else name)
+    return protected
 
 
 def split_httpx_output(
