@@ -1,0 +1,2 @@
+# Les scripts shell doivent garder des fins de ligne LF (exécution sous Linux/Kali).
+*.sh text eol=lf

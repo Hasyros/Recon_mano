@@ -289,7 +289,7 @@ urlfinder pour ne pas marteler les mêmes archives.
 
 | Symptôme | Cause probable / remède |
 |---|---|
-| `httpx (ProjectDiscovery) introuvable` | Un `httpx` du PATH est le client Python. Installe le vrai (`go install github.com/projectdiscovery/httpx/cmd/httpx@latest`) ou passe `--httpx-bin`. |
+| `httpx (ProjectDiscovery) introuvable` | Un `httpx` du PATH est le client Python. Installe le vrai (`./install.sh`, ou `go install github.com/projectdiscovery/httpx/cmd/httpx@latest`) ou passe `--httpx-bin`. |
 | urlfinder rend très peu (sans erreur) | Throttling silencieux par IP. Laisse reposer / change d'IP (§7). |
 | dnsx efface presque tout | Domaine wildcard légitime, ou résolveur lent. Diagnostique avec `--no-wildcard-filter`. |
 | katana traîne / ne finit pas | Le `-ct` est **par seed** : borne le module (`--module-timeout katana=45`), baisse `--depth 1` ou `--katana-max-pages`. Le dédoublonnage par contenu (activé) réduit déjà les hôtes. |

@@ -11,6 +11,7 @@
 !/README.md
 !/WORKFLOW.md
 !/CHANGELOG.md
+!/install.sh
 !/bench/
 !/pyproject.toml
 !/requirements.txt

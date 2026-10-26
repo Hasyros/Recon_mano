@@ -648,24 +648,57 @@ Avec `-n`, **nuclei #2 attend arjun** et ajoute ses URLs à son run DAST.
 
 ## Installation
 
-### Dépendances Python
+### Installation en une commande (Kali / Debian)
 
 ```bash
-python -m pip install -r requirements.txt
+git clone <url-du-depot> Recon_mano && cd Recon_mano
+./install.sh
+source ~/.zshrc            # ou ouvre un nouveau terminal
+recon_mano cible.com -y
 ```
 
-Sur Kali (Python « externally-managed », PEP 668), préférer `pipx`, un venv, ou ajouter
-`--break-system-packages` à tes risques. Sans installer le paquet : `python -m recon_mano …` marche
-depuis le dossier du projet (il faut `typer` et `rich`).
+**Mettre à jour** : `git pull && ./install.sh`. Le script est idempotent, il réinstalle le code
+(`pipx install --force .`) et recompile les outils Go en `@latest`.
+
+Ce qu'il fait, dans l'ordre :
+
+1. apt (un `update`, puis `git pipx libpcap-dev chromium` et les outils de compilation ; `amass`,
+   `arjun`, `trufflehog`, `gitleaks` un par un, un paquet absent du dépôt est toléré) ;
+2. vérifie Go (>= 1.26, exigé par nuclei/katana/httpx/subfinder) ; sinon propose le Go officiel
+   (go.dev, sha256 vérifié, `/usr/local/go`) ;
+3. `go install …@latest` : subfinder, dnsx, httpx, urlfinder, katana, naabu, nuclei (de base, un échec
+   fait échouer le script à la fin) puis gau, waybackurls, jsluice, subzy, gf (optionnels) ;
+   repli pour amass / trufflehog / gitleaks (build Go) et arjun (`pipx`) si apt ne les a pas ;
+4. `nuclei -update-templates` ;
+5. installe la CLI avec `pipx` ; ajoute `~/go/bin` et `~/.local/bin` au `PATH` de `~/.zshrc` et
+   `~/.bashrc` (une seule fois, repère `# recon_mano`) ;
+6. lance `recon_mano --check` et affiche un tableau installé / échec / sauté.
+
+| Option | Effet |
+|---|---|
+| `--core` | outils de base seulement (saute les optionnels) |
+| `--install-go` | installe le Go officiel sans poser la question (sinon : question si terminal interactif, échec avec la marche à suivre sinon) |
+| `--no-apt` | saute apt (machine sans sudo ; installe `git golang-go pipx libpcap-dev` toi-même) |
+| `--dry-run` | affiche chaque commande sans rien exécuter |
+| `--verbose` | affiche toute la sortie des commandes |
+
+Root fonctionne (pas de `sudo`, `HOME=/root`). Le script ne touche pas à `httpx` côté Python : seul le
+`httpx` de ProjectDiscovery est installé.
+
+<details>
+<summary>Installation manuelle (référence)</summary>
+
+#### Dépendances Python
 
 ```bash
-pipx install -e .        # commande courte `recon_mano` (recommandé)
-python3 -m venv .venv && .venv/bin/pip install -e .
+pipx install .           # commande courte `recon_mano` (Kali : Python « externally-managed », PEP 668)
+python3 -m venv .venv && .venv/bin/pip install -e .      # alternative
+python -m pip install -r requirements.txt                # sans installer le paquet : `python -m recon_mano …`
 ```
 
-### Outils externes
+#### Outils externes (dans le `PATH`)
 
-Requis (dans le `PATH`) :
+Requis :
 
 ```bash
 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -684,13 +717,16 @@ go install github.com/lc/gau/v2/cmd/gau@latest                              # ga
 go install github.com/tomnomnom/waybackurls@latest                          # waybackurls
 go install github.com/tomnomnom/gf@latest                                   # passe 2 de nuclei (liste prioritaire)
 go install github.com/BishopFox/jsluice/cmd/jsluice@latest                  # jsluice
-python -m pip install arjun                                                 # arjun
-sudo apt install chromium                                                   # katana --katana-headless (Kali/Debian)
+go install github.com/PentestPad/subzy@latest                               # takeover
+go install github.com/owasp-amass/amass/v5/cmd/amass@main                   # amass (ou sudo apt install amass)
+pipx install arjun                                                          # arjun (ou sudo apt install arjun)
+sudo apt install chromium trufflehog gitleaks                               # katana --katana-headless ; secrets
 ```
 
-À installer selon le README upstream de chaque projet (le chemin `go install` ou le paquet change) :
-**amass** (`github.com/owasp-amass/amass` ; v4 et v5 sont gérées), **subzy**, **trufflehog**
-(`github.com/trufflesecurity/trufflehog`), **gitleaks** (`github.com/gitleaks/gitleaks`).
+trufflehog et gitleaks se compilent depuis un clone (`git clone --depth 1 <dépôt> && cd <dépôt> && go build -o ~/go/bin/<nom> .`) :
+le `go.mod` de trufflehog contient des `replace`, incompatibles avec `go install …@latest`.
+
+</details>
 
 > **Piège `httpx`.** Le client HTTP Python s'installe aussi sous le nom `httpx` dans le PATH et n'a
 > aucun des flags attendus. `--check` distingue les deux via `httpx -version` ; si le mauvais binaire
