@@ -10,6 +10,8 @@
 !/.gitignore
 !/README.md
 !/WORKFLOW.md
+!/CHANGELOG.md
+!/bench/
 !/pyproject.toml
 !/requirements.txt
 !/recon_mano/

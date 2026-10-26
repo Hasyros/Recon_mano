@@ -147,7 +147,7 @@ def test_without_n_httpx_command_has_no_cdn_and_nothing_nuclei_runs(tmp_path, mo
     assert len(httpx_commands) == 3 and all("-cdn" not in c for c in httpx_commands)       # httpx, httpx #2, httpx ports
     assert statuses(scheduler)["nuclei1"] is Status.SKIPPED and statuses(scheduler)["nuclei2"] is Status.SKIPPED
     assert "nuclei" not in tools.calls and "gf" not in tools.calls
-    assert scheduler.records["katana"].rate == 150
+    assert scheduler.records["katana"].rate == 100
     assert not [p.name for p in tmp_path.iterdir() if "nuclei" in p.name]
     for key in ("nuclei1_input", "nuclei2_input", "nuclei1_jsonl", "nuclei2_jsonl", "nuclei"):
         assert not build_paths(tmp_path)[key].exists()
@@ -162,7 +162,7 @@ def test_pass_2_only_does_not_need_cdn(tmp_path, monkeypatch):
     scheduler, _, tools = run_dag(tmp_path, monkeypatch, nuclei=True, nuclei_passes="2")
     assert "-cdn" not in tools.of("httpx")[0]
     assert statuses(scheduler)["nuclei1"] is Status.SKIPPED and statuses(scheduler)["nuclei2"] is Status.DONE
-    assert scheduler.records["katana"].rate == 150                                              # nuclei1 absent : katana a tout
+    assert scheduler.records["katana"].rate == 100                                              # nuclei1 absent : katana garde sa demande (100)
 
 
 # --------------------------------------------------------------------------- #
@@ -418,7 +418,7 @@ def test_nuclei1_runs_during_katana_and_shares_the_budget(tmp_path, monkeypatch)
     assert n1.start <= katana.start + 0.05                       # même tour d'ordonnanceur : nuclei1 passe d'abord
     # Budget : nuclei 50 d'abord, katana prend le reste ; jamais plus de --max-rps.
     assert n1.rate == 50 and katana.rate == 100 and n1.rate + katana.rate <= 150
-    assert katana.requested_rate == 150
+    assert katana.requested_rate == 100
     # La passe 2 attend httpx #2 ; la 1 n'attend pas la fin du crawl.
     assert scheduler.records["nuclei2"].start >= scheduler.records["httpx2"].end - 1e-3
     # run_stats.json expose les décalages de départ qui prouvent le chevauchement.

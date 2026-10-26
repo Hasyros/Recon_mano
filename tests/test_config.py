@@ -48,8 +48,8 @@ def test_full_preset_lists_every_module_of_the_dag_in_order():
     assert PRESETS["full"] == list(MODULE_DEFAULTS) == built
     assert preset_modules() == built
     with pytest.raises(ValueError, match="preset inconnu"):
-        preset_modules("fast")                           # fast / surface : phase ultérieure
-    assert set(PRESETS) == {"full"}
+        preset_modules("bogus")
+    assert set(PRESETS) == {"fast", "surface", "full"}
 
 
 def test_defaults_in_the_registry_match_the_built_modules():

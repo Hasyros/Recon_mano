@@ -57,7 +57,8 @@ def test_new_modules_are_registered_on_by_default_with_the_right_network_flags()
 def test_dag_dependencies():
     modules = {m.name: m for m in build_modules(Options(target="example.com"))}
     assert modules["jsluice"].deps == ["katana"] and modules["secrets"].deps == ["katana", "jsluice"]
-    assert modules["takeover"].deps == ["dnsx"] and modules["naabu"].deps == ["dnsx"]
+    # + httpx : ne pas démarrer avant httpx #1 (chemin critique) ni lui prendre du budget.
+    assert modules["takeover"].deps == ["dnsx", "httpx"] and modules["naabu"].deps == ["dnsx", "httpx"]
     assert modules["httpx_ports"].deps == ["naabu"] and modules["nuclei_ports"].deps == ["httpx_ports"]
     assert modules["merge_map"].deps == ["katana", "gau", "waybackurls", "jsluice"]
     assert modules["httpx2"].deps == ["merge_map", "httpx_ports"]

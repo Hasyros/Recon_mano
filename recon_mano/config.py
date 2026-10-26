@@ -7,9 +7,11 @@ timeout et ses paramètres propres. Les options de la CLI (`--no-amass`,
 `Options` (modules.py) et les valeurs par défaut de Typer (cli.py) s'en servent
 comme source unique.
 
-`PRESETS` regroupera plus tard des jeux de modules (fast / surface…) : pour l'instant
-seul `full` existe — tous les modules, chacun dans son état par défaut. Il n'y a
-pas encore d'option `--mode`.
+`PRESETS` regroupe des jeux de modules (fast / surface / full) et `resolve_modules`
+calcule, pour un preset + des surcharges, l'état final de chaque module. La CLI utilise
+`full` pour l'instant ; l'option `--mode` n'est pas encore branchée (voir cli.py).
+Précédence, de la plus forte à la plus faible : option par module (`--X` / `--no-X`,
+`--skip-X`) > `--enable` / `--disable` > preset.
 
 Règles de fond rappelées ici :
 
@@ -26,7 +28,7 @@ Règles de fond rappelées ici :
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -61,10 +63,19 @@ MODULE_DEFAULTS: Dict[str, ModuleDefaults] = {
     ),
     "httpx": ModuleDefaults(binaries=("httpx",), network=True, rate=150, params={"threads": 50}),
     "nuclei1": ModuleDefaults(enabled=False, binaries=("nuclei",), network=True, rate=50, note="opt-in (-n)"),
-    # katana passe AVANT takeover / naabu : à budget égal il garde la priorité (nuclei #1 50 + katana 100).
+    # katana passe AVANT takeover / naabu : à budget égal il garde la priorité. Il ne demande plus tout le
+    # budget (150) mais 100 : les 50 req/s restants servent takeover / naabu / httpx ports pendant le crawl
+    # (avec -n : nuclei #1 50 + katana 100 = 150).
     "katana": ModuleDefaults(
-        binaries=("katana",), network=True, rate=150, params={"concurrency": 10, "store": True},
-        note="stocke les réponses (responses/katana) pour jsluice et secrets",
+        binaries=("katana",), network=True, rate=100,
+        params={
+            "concurrency": 10, "store": True,
+            "dedupe_hosts": True,          # un seul hôte par empreinte de contenu (httpx -hash sha256 + code + taille)
+            "headless": "auto",            # auto | off | all : navigateur sans tête pour les hôtes à framework JS
+            "headless_concurrency": 3,
+            "no_sandbox": "auto",          # auto = -no-sandbox si root | on | off
+        },
+        note="stocke les réponses (responses/katana) pour jsluice et secrets ; headless ciblé, hôtes dédupliqués",
     ),
     "takeover": ModuleDefaults(
         binaries=("dnsx",), network=True, rate=10, timeout=15 * 60,
@@ -101,10 +112,33 @@ MODULE_DEFAULTS: Dict[str, ModuleDefaults] = {
     "nuclei2": ModuleDefaults(enabled=False, binaries=("nuclei",), network=True, rate=150, note="opt-in (-n)"),
 }
 
-# Presets : nom -> modules disponibles. `full` = tous ; nuclei y figure mais reste
-# désactivé tant que `-n` n'est pas passé (opt-in strict).
+# Modules de la famille nuclei : seuls opt-in (`-n`), dans tout preset.
+NUCLEI_MODULES: Tuple[str, ...] = ("nuclei1", "nuclei_ports", "nuclei2")
+
+# Presets : nom -> modules du jeu (listes simples). Un module nuclei listé n'est actif qu'avec `-n`
+# (opt-in strict) ; `surface` n'en contient aucun, même avec `-n`.
 PRESETS: Dict[str, List[str]] = {
+    # Reconnaissance rapide : sous-domaines -> DNS -> vivacité (+ nuclei passe 1 avec -n).
+    "fast": ["subfinder", "subdomains", "dnsx", "httpx", "nuclei1"],
+    # Toute la surface, aucune attaque : jamais de nuclei.
+    "surface": [
+        "subfinder", "crtsh", "amass", "subdomains", "dnsx", "urlfinder", "gau", "waybackurls", "httpx",
+        "katana", "takeover", "naabu", "httpx_ports", "jsluice", "secrets", "merge_map", "httpx2", "tree", "arjun",
+    ],
+    # Tout (nuclei toujours soumis à -n).
     "full": list(MODULE_DEFAULTS),
+}
+
+# Modules de « plomberie » (ni binaire ni trafic) dont l'aval lit l'état : ils sont activés
+# automatiquement dès qu'un de leurs consommateurs l'est (sinon ces consommateurs s'ignoreraient
+# faute de données). Les désactiver explicitement alors qu'un consommateur est actif = erreur.
+# Ordre = ordre de résolution (merge_map avant subdomains, qui l'alimente en consommateurs).
+PLUMBING: Dict[str, Tuple[str, ...]] = {
+    "merge_map": ("httpx2",),
+    "subdomains": (
+        "dnsx", "httpx", "katana", "takeover", "naabu", "merge_map", "arjun", "tree",
+        "nuclei1", "nuclei2",
+    ),
 }
 
 
@@ -150,3 +184,70 @@ def parse_module_timeouts(specs: List[str]) -> Dict[str, Optional[int]]:
             raise ValueError("--module-timeout : une durée négative n'a pas de sens (0 = illimité)")
         result[name] = max(int(minutes * 60), 1) if minutes > 0 else None
     return result
+
+
+def parse_module_names(spec: str, option: str) -> Set[str]:
+    """`"gau, amass"` → {"gau", "amass"} (virgules ou espaces). ValueError sur un module inconnu."""
+    names = {token.lower() for token in spec.replace(",", " ").split() if token.strip()}
+    unknown = sorted(names - set(MODULE_DEFAULTS))
+    if unknown:
+        raise ValueError(f"{option} : module(s) inconnu(s) « {', '.join(unknown)} » ({', '.join(MODULE_DEFAULTS)})")
+    return names
+
+
+def resolve_modules(
+    preset: str,
+    enable: Iterable[str] = (),
+    disable: Iterable[str] = (),
+    nuclei: bool = False,
+    flags: Optional[Dict[str, bool]] = None,
+) -> Dict[str, bool]:
+    """État final de chaque module : {nom: actif}, dans l'ordre du registre.
+
+    Précédence (la plus forte d'abord) : `flags` (options par module `--X/--no-X`, `--skip-X`)
+    > `enable` / `disable` (`--enable` / `--disable`) > `preset`. Ensuite :
+
+    - **nuclei** : sa famille (`NUCLEI_MODULES`) exige `nuclei=True` (`-n`). Un module nuclei
+      listé par le preset reste simplement éteint sans `-n` ; l'activer *explicitement* (`enable`,
+      flag) sans `-n` lève ValueError — jamais d'attaque silencieusement ignorée ni lancée.
+    - **plomberie** (`PLUMBING`) : activée d'office si un consommateur l'est ; la désactiver
+      explicitement alors lève ValueError.
+
+    Lève ValueError sur un preset ou un nom de module inconnu, ou un module à la fois dans
+    `enable` et `disable`.
+    """
+    base = set(preset_modules(preset))
+    on, off, flags = set(enable), set(disable), dict(flags or {})
+    for label, names in (("enable", on), ("disable", off), ("flags", flags)):
+        unknown = sorted(set(names) - set(MODULE_DEFAULTS))
+        if unknown:
+            raise ValueError(f"module(s) inconnu(s) dans {label} : {', '.join(unknown)}")
+    clash = sorted(on & off)
+    if clash:
+        raise ValueError(f"--enable et --disable : « {', '.join(clash)} » demandé(s) activé(s) ET désactivé(s)")
+
+    wanted: Dict[str, bool] = {}
+    for name in MODULE_DEFAULTS:
+        if name in flags:
+            wanted[name] = bool(flags[name])
+        elif name in on:
+            wanted[name] = True
+        elif name in off:
+            wanted[name] = False
+        else:
+            wanted[name] = name in base
+
+    if not nuclei:
+        for name in NUCLEI_MODULES:
+            if wanted[name] and (name in on or flags.get(name)):
+                raise ValueError(f"{name} fait partie de la famille nuclei, opt-in : ajoute -n (--nuclei) pour l'activer")
+            wanted[name] = False
+
+    for name, consumers in PLUMBING.items():
+        needed = [c for c in consumers if wanted[c]]
+        if not needed:
+            continue
+        if not wanted[name] and (name in flags or name in off):
+            raise ValueError(f"{name} ne peut pas être désactivé : requis par {', '.join(needed)}")
+        wanted[name] = True
+    return wanted

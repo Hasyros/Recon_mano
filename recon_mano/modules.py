@@ -31,6 +31,12 @@ gitleaks) — ni l'un ni l'autre n'envoie de requête. `takeover` repère les CN
 et `nuclei_ports` (opt-in) les scanne. `arjun` cherche des paramètres cachés sur quelques URLs
 représentatives et nourrit le run DAST de nuclei #2.
 
+Phase 5 : katana demande 100 req/s (et non 150) pour laisser 50 req/s à takeover / naabu / httpx ports
+pendant le crawl ; httpx #1 calcule `-hash sha256` pour que katana ne crawle qu'un hôte par empreinte de
+contenu (`06_katana_dedup.tsv`) ; les hôtes à framework JS passent dans un second crawl `-headless` du même
+module. Les modules actifs peuvent être restreints par `Options.modules` (preset, `--enable` / `--disable`,
+voir `config.resolve_modules`).
+
 Chaque fonction `run_*` reproduit l'étape historique de `main()` : mêmes fichiers,
 même filtrage de périmètre, mêmes replis. Ce qui change : elle lit l'état laissé
 par ses dépendances dans `ctx.state` (`hosts_file`, `httpx_live`…) au lieu de
@@ -41,6 +47,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import time
@@ -56,8 +63,10 @@ from .io_utils import count_lines, read_lines, write_lines
 from .liveness import (
     DEFAULT_LIVE_CODES,
     clean_live_urls,
+    dedupe_seed_hosts,
     filter_live,
     iter_httpx_rows,
+    js_heavy_hosts,
     parse_codes,
     protected_hosts,
     seen_urls,
@@ -68,6 +77,7 @@ from .liveness import (
 from .pipeline import Context, Module, ModuleError, ModuleResult, ModuleSkipped, Status
 from .report import write_report as write_tree_report
 from .scope import ScopeFilter, host_of
+from .signatures import host_port
 from . import surface
 from .ui import STAGE_ICONS, console, eta_line, human_duration, report
 
@@ -119,6 +129,11 @@ class Options:
     katana_ignore_query: bool = False
     katana_filter_similar: bool = True
     katana_store: bool = default_param("katana", "store")           # réponses stockées : requis par jsluice et secrets
+    katana_rate_limit: int = MODULE_DEFAULTS["katana"].rate         # req/s demandées (100 : laisse 50 aux autres modules)
+    katana_dedupe_hosts: bool = default_param("katana", "dedupe_hosts")
+    katana_headless: str = default_param("katana", "headless")      # auto | off | all
+    katana_headless_concurrency: int = default_param("katana", "headless_concurrency")
+    katana_no_sandbox: str = default_param("katana", "no_sandbox")  # auto (root) | on | off
     urlfinder_all: bool = True
     urlfinder_retries: int = 1
     urlfinder_retry_wait: int = 30
@@ -183,6 +198,20 @@ class Options:
     skip_urlfinder: bool = False
     skip_httpx: bool = False
     skip_katana: bool = False
+    # État final des modules (`config.resolve_modules`) : un module absent ou à True suit ses options
+    # habituelles, à False il est désactivé (preset, --disable).
+    modules: Optional[Dict[str, bool]] = None
+
+    def __post_init__(self) -> None:
+        # Les cinq étapes « skip » portent des replis historiques (httpx désactivé → katana sur les
+        # entrées brutes, --subdomains…) : un module éteint par `modules` passe par le même chemin.
+        for name in ("subfinder", "dnsx", "urlfinder", "httpx", "katana"):
+            if self.modules and self.modules.get(name) is False:
+                setattr(self, f"skip_{name}", True)
+
+    def module_on(self, name: str) -> bool:
+        """Faux si `modules` (preset / --enable / --disable) éteint ce module."""
+        return self.modules is None or self.modules.get(name, True)
 
     def module_timeout(self, name: str) -> Optional[int]:
         """Timeout (s) du module : option CLI si fournie, sinon défaut de `config`."""
@@ -463,6 +492,7 @@ def stage_httpx(
     label: str = "httpx",
     cdn: bool = False,
     split: bool = True,
+    hashes: str = "",
 ) -> Tuple[int, int, int, float]:
     """Une passe httpx puis éclatement : `all_file` (annoté, tous codes retenus par
     -mc), `ok_file` (200 seuls) et `live_file` (URLs nues dont le code est dans
@@ -471,6 +501,10 @@ def stage_httpx(
     `cdn` ajoute `-cdn` (champs `cdn`, `cdn_name`, `cdn_type` dans le JSONL) : demandé
     seulement quand nuclei passe 1 est actif, pour ralentir derrière les WAF/CDN.
     Sans lui, la commande est strictement celle d'avant.
+
+    `hashes` ajoute `-hash <algo>` (httpx : md5, mmh3, simhash, sha1, sha256, sha512) : champ JSONL
+    `hash` = {`body_sha256`, `header_sha256`}, lu pour dédoublonner les hôtes de katana. Vide = rien
+    de changé à la commande.
 
     `split=False` : seule la passe est lancée (le JSONL est écrit), l'éclatement en
     listes est laissé à l'appelant — httpx #2 fusionne d'abord ses lignes avec celles
@@ -487,6 +521,8 @@ def stage_httpx(
     ]
     if cdn:
         command.append("-cdn")
+    if hashes:
+        command += ["-hash", hashes]
     command += [
         "-match-code",
         match_codes,
@@ -504,7 +540,13 @@ def stage_httpx(
     return total, alive, live, elapsed
 
 
-def stage_katana(
+def running_as_root() -> bool:
+    """Vrai si le processus tourne en root (Kali) : Chromium refuse alors de démarrer sans -no-sandbox."""
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid and geteuid() == 0)
+
+
+def katana_command(
     source: Path,
     destination: Path,
     depth: int,
@@ -516,9 +558,15 @@ def stage_katana(
     duration: str,
     ignore_query: bool,
     filter_similar: bool,
-    timeout: Optional[int] = None,
     store_dir: Optional[Path] = None,
-) -> Tuple[int, float]:
+    headless: bool = False,
+    no_sandbox: bool = False,
+) -> List[str]:
+    """Commande katana. `headless` ajoute `-headless` (navigateur sans tête, expérimental) et, si
+    `no_sandbox`, `-no-sandbox` (indispensable en root). Pas de `-xhr-extraction` : il n'écrit les
+    requêtes XHR que dans une sortie `-jsonl`, or la nôtre est une liste d'URLs. Pas de
+    `-store-response` en headless : katana ne le gère pas dans ce mode (le stockage reste au crawl
+    standard). `-crawl-duration` s'applique PAR SEED, pas à l'ensemble du run."""
     command = [
         "katana",
         "-list",
@@ -542,15 +590,47 @@ def stage_katana(
     if max_pages > 0:
         command += ["-max-domain-pages", str(max_pages)]  # plafond dur par domaine
     if duration.strip():
-        command += ["-crawl-duration", duration.strip()]  # coupe après la durée
+        command += ["-crawl-duration", duration.strip()]  # coupe après la durée (par seed)
     if js_crawl:
         command.append("-jc")
-    if store_dir is not None:
+    if headless:
+        command.append("-headless")
+        if no_sandbox:
+            command.append("-no-sandbox")
+    elif store_dir is not None:
         # Réponses brutes sur disque : jsluice et secrets travaillent hors ligne dessus (aucune requête de plus).
         command += ["-store-response", "-store-response-dir", str(store_dir)]
     command += ["-o", str(destination)]
-    _, elapsed, _ = runner.run_command(command, "katana", watch=destination, timeout=timeout)
-    return write_lines(destination, read_lines(destination)), elapsed
+    return command
+
+
+def stage_katana(
+    source: Path,
+    destination: Path,
+    depth: int,
+    scope: str,
+    js_crawl: bool,
+    rate_limit: int,
+    concurrency: int,
+    max_pages: int,
+    duration: str,
+    ignore_query: bool,
+    filter_similar: bool,
+    timeout: Optional[int] = None,
+    store_dir: Optional[Path] = None,
+    headless: bool = False,
+    no_sandbox: bool = False,
+) -> Tuple[int, float, int, str]:
+    """Un crawl katana → `destination`. Retourne (URLs, secondes, code retour, stderr) : le code sert
+    à repérer l'échec d'un crawl headless (pas de Chrome…)."""
+    command = katana_command(
+        source, destination, depth, scope, js_crawl, rate_limit, concurrency, max_pages, duration,
+        ignore_query, filter_similar, store_dir, headless, no_sandbox,
+    )
+    rc, elapsed, stderr = runner.run_command(
+        command, "katana headless" if headless else "katana", watch=destination, timeout=timeout
+    )
+    return write_lines(destination, read_lines(destination)), elapsed, rc, stderr
 
 
 def stage_jsluice(files_list: Path, destination: Path, mode: str, concurrency: int, timeout: Optional[int] = None) -> float:
@@ -764,7 +844,11 @@ def ensure_httpx_input(ctx: Context) -> int:
     with ctx.lock:
         if "merged" not in ctx.state:
             hosts_file = ctx.state.get("hosts_file", ctx.paths["subdomains"])
-            merged = merge_files([hosts_file, ctx.paths["urlfinder"]], ctx.paths["httpx_input"])
+            sources = [hosts_file]
+            # urlfinder désactivé (preset, --skip-urlfinder) : son fichier d'un run précédent ne compte pas.
+            if "urlfinder" not in ctx.records or produced(ctx, "urlfinder"):
+                sources.append(ctx.paths["urlfinder"])
+            merged = merge_files(sources, ctx.paths["httpx_input"])
             ctx.state["merged"] = merged
             ctx.log(f"\n[bold]Fusion des deux branches[/bold] → {merged} entrées")
         return ctx.state["merged"]
@@ -1004,14 +1088,14 @@ def run_waybackurls(ctx: Context) -> ModuleResult:
 
 def _run_httpx_pass(
     ctx: Context, source: Path, jsonl: Path, all_f: Path, ok_f: Path, live_f: Path, entries: int, label: str,
-    cdn: bool = False,
+    cdn: bool = False, hashes: str = "",
 ) -> Tuple[int, int, int]:
     """Une passe httpx + journal commun à httpx #1 et #2."""
     o = ctx.options
     ctx.log(eta_line(entries, ctx.rate, f"requêtes @ {ctx.rate}/s (plancher)"))
     total, alive, live, elapsed = stage_httpx(
         ctx.state["httpx_path"], source, jsonl, all_f, ok_f, live_f,
-        o.match_codes, o.threads, ctx.rate, o.live_code_set, ctx.remaining(), label, cdn,
+        o.match_codes, o.threads, ctx.rate, o.live_code_set, ctx.remaining(), label, cdn, hashes=hashes,
     )
     ctx.log(report(total, all_f, elapsed))
     ctx.log(f"  [green]→ {alive} en 200[/green] · {ok_f.name}")
@@ -1026,7 +1110,8 @@ def run_httpx(ctx: Context) -> ModuleResult:
     merged = ensure_httpx_input(ctx)
     total, _, live = _run_httpx_pass(
         ctx, paths["httpx_input"], paths["httpx_jsonl"], paths["urls_all"], paths["urls_200"],
-        paths["urls_live"], merged, "httpx", cdn=ctx.options.nuclei_pass_enabled(1),
+        paths["urls_live"], merged, "httpx", cdn=ctx.options.nuclei_pass_enabled(1) and ctx.options.module_on("nuclei1"),
+        hashes=KATANA_HASH if katana_dedupes(ctx.options) else "",
     )
     ctx.state.update(httpx_ran=True, httpx_live=live)
     if not live:
@@ -1034,33 +1119,153 @@ def run_httpx(ctx: Context) -> ModuleResult:
     return ModuleResult(total)
 
 
+# Empreinte de contenu demandée à httpx #1 pour le dédoublonnage des hôtes de katana (champ JSONL
+# `hash.body_sha256`).
+KATANA_HASH = "sha256"
+
+
+@dataclass
+class KatanaPlan:
+    """Ce que katana va crawler : seeds standard, seeds headless, hôtes écartés (doublons de contenu)."""
+
+    standard: List[str]
+    headless: List[str]
+    dropped: List[Tuple[str, str, str]] = field(default_factory=list)   # (hôte gardé, hôte écarté, empreinte)
+    frameworks: Dict[str, List[str]] = field(default_factory=dict)      # hôte headless -> frameworks JS
+
+
+def plan_katana(seeds: List[str], rows: List[Dict[str, Any]], dedupe: bool, headless: str) -> KatanaPlan:
+    """Répartit les seeds : doublons de contenu écartés (`dedupe`), puis seeds des hôtes à framework
+    JS vers le crawl headless (`auto`), tous (`all`) ou aucun (`off`). `rows` = lignes d'httpx #1 ;
+    vides, ni dédoublonnage ni détection (`all` n'en a pas besoin)."""
+    dropped: List[Tuple[str, str, str]] = []
+    kept = list(seeds)
+    if dedupe and rows:
+        kept, dropped = dedupe_seed_hosts(kept, rows)
+    frameworks: Dict[str, List[str]] = {}
+    if headless == "all":
+        frameworks = {host_port(url): [] for url in kept}
+    elif headless == "auto" and rows:
+        heavy = js_heavy_hosts(rows)
+        for host in dict.fromkeys(host_port(url) for url in kept):
+            if host in heavy:
+                frameworks[host] = heavy[host]
+    deep = [url for url in kept if host_port(url) in frameworks]
+    standard = [url for url in kept if host_port(url) not in frameworks]
+    return KatanaPlan(standard, deep, dropped, frameworks)
+
+
+def katana_dedupes(o: "Options") -> bool:
+    """httpx #1 doit calculer les empreintes (`-hash`) : dédoublonnage demandé ET katana actif."""
+    return o.katana_dedupe_hosts and not o.skip_katana and o.module_on("katana")
+
+
 def run_katana(ctx: Context) -> ModuleResult:
+    """Crawl katana des seeds vivantes, en un ou deux passages dans le même module.
+
+    - **Dédoublonnage par contenu** (`--katana-dedupe-hosts`, défaut) : les hôtes dont la racine a la
+      même empreinte (hash du corps httpx + code + taille) ne sont crawlés qu'une fois (le premier) ;
+      les écartés sont listés dans `06_katana_dedup.tsv`. Les livrables ne perdent aucun hôte.
+    - **Headless ciblé** (`--katana-headless`, défaut auto) : les hôtes à framework JS (d'après
+      `httpx -tech-detect`) passent dans un second crawl `-headless`, à concurrence réduite, après le crawl
+      standard. Si ce second crawl échoue (pas de Chrome…), les résultats du crawl standard sont gardés.
+      Katana ne stocke pas les réponses en headless : jsluice et secrets ne voient que le crawl standard.
+    Sorties fusionnées dans `06_katana.txt`."""
     o, paths = ctx.options, ctx.paths
     if not _hosts_available(ctx):
         raise ModuleSkipped("aucun hôte en périmètre — rien à crawler")
     seeds, why = katana_seeds(ctx)
     if seeds is None:
         raise ModuleSkipped(f"{why} — katana ne crawle pas de cibles non confirmées")
+    for key in ("katana", "katana_seeds", "katana_headless_seeds", "katana_dedup"):
+        paths[key].unlink(missing_ok=True)
     store_dir = paths["responses_dir"] if o.katana_store else None
     if store_dir is not None:
         # index.txt est ouvert en ajout par katana : on repart d'un dossier vide (jamais de réponses périmées).
         shutil.rmtree(store_dir, ignore_errors=True)
         store_dir.mkdir(parents=True, exist_ok=True)
-    n, elapsed = stage_katana(
-        seeds, paths["katana"], o.depth, o.katana_scope, o.js_crawl, ctx.rate, o.concurrency,
-        o.katana_max_pages, o.katana_duration, o.katana_ignore_query, o.katana_filter_similar,
-        ctx.remaining(), store_dir,
-    )
-    ctx.log(report(n, paths["katana"], elapsed))
+
+    # Lignes httpx #1 : seulement si les seeds en viennent (pas le repli --skip-httpx sur les entrées brutes).
+    rows = list(iter_httpx_rows(read_lines(paths["httpx_jsonl"]))) if seeds == paths["urls_live"] else []
+    plan = plan_katana(read_lines(seeds), rows, o.katana_dedupe_hosts, o.katana_headless)
+    notes: List[str] = []
+    if plan.dropped:
+        write_lines(paths["katana_dedup"], [f"{kept}\t{gone}\t{fp}" for kept, gone, fp in plan.dropped])
+        notes.append(f"{len(plan.dropped)} hôtes dédoublonnés")
+        ctx.log(
+            f"  [dim]dédoublonnage : {len(plan.dropped)} hôte(s) au contenu identique à un autre ne sont pas crawlés "
+            f"→ {paths['katana_dedup'].name} (livrables inchangés)[/dim]"
+        )
+    elif o.katana_dedupe_hosts and rows:
+        ctx.log("  [dim]dédoublonnage : aucun hôte au contenu identique[/dim]")
+    standard_seeds = seeds
+    if plan.dropped or plan.headless:
+        standard_seeds = paths["katana_seeds"]
+        write_lines(standard_seeds, plan.standard)
+
+    if plan.standard or not plan.headless:
+        count, elapsed, _, _ = stage_katana(
+            standard_seeds, paths["katana"], o.depth, o.katana_scope, o.js_crawl, ctx.rate, o.concurrency,
+            o.katana_max_pages, o.katana_duration, o.katana_ignore_query, o.katana_filter_similar,
+            ctx.remaining(), store_dir,
+        )
+        ctx.log(report(count, paths["katana"], elapsed))
+    if plan.headless:
+        notes.extend(_run_katana_headless(ctx, plan))
+    if not paths["katana"].exists():
+        write_lines(paths["katana"], [])
     n = apply_scope(ctx.scope, paths["katana"], "katana", ctx.log)
     if o.js_crawl:
         ctx.log("[dim]  -jc actif : endpoints extraits du JS non requêtés, donc non validés.[/dim]")
-    note = ""
     if store_dir is not None:
         files, size = surface.dir_size(store_dir)
-        note = f"{files} réponses stockées ({surface.human_size(size)})"
+        notes.insert(0, f"{files} réponses stockées ({surface.human_size(size)})")
         ctx.log(f"  [dim]réponses brutes dans {store_dir.relative_to(ctx.output)} (jsluice et secrets les lisent hors ligne)[/dim]")
-    return ModuleResult(n, note=note)
+    return ModuleResult(n, note=" · ".join(notes))
+
+
+def _run_katana_headless(ctx: Context, plan: KatanaPlan) -> List[str]:
+    """Second crawl, `-headless`, sur les hôtes JS ; fusionne sa sortie dans `06_katana.txt`.
+    Ne lève jamais : un échec (pas de Chrome…) est journalisé et le crawl standard est conservé.
+    Retourne les notes à afficher dans le récapitulatif."""
+    o, paths = ctx.options, ctx.paths
+    sandbox = {"on": True, "off": False}.get(o.katana_no_sandbox, running_as_root())
+    hosts = list(plan.frameworks)
+    shown = ", ".join(f"{h} ({'/'.join(f) if f else 'forcé'})" for h, f in list(plan.frameworks.items())[:5])
+    ctx.log(
+        f"  [dim]headless ({o.katana_headless}) : {len(hosts)} hôte(s) JS · {len(plan.headless)} seeds · "
+        f"concurrence {o.katana_headless_concurrency}{' · -no-sandbox' if sandbox else ''} — {shown}"
+        f"{' …' if len(hosts) > 5 else ''}[/dim]"
+    )
+    write_lines(paths["katana_headless_seeds"], plan.headless)
+    if ctx.deadline is not None and time.monotonic() >= ctx.deadline:
+        ctx.log("  [yellow]délai du module épuisé : crawl headless non lancé[/yellow]")
+        return ["headless non lancé (délai)"]
+    raw = ctx.output / ".katana_headless.tmp"
+    raw.unlink(missing_ok=True)
+    try:
+        found, elapsed, rc, stderr = stage_katana(
+            paths["katana_headless_seeds"], raw, o.depth, o.katana_scope, o.js_crawl, ctx.rate,
+            o.katana_headless_concurrency, o.katana_max_pages, o.katana_duration, o.katana_ignore_query,
+            o.katana_filter_similar, ctx.remaining(), None, True, sandbox,
+        )
+        ok = rc in (0, 124)    # 124 = délai du module : ce qui a été trouvé est gardé
+        if ok:
+            ctx.log(report(found, raw, elapsed))
+        else:
+            detail = (stderr.strip().splitlines() or [""])[-1][:160]
+            ctx.log(
+                f"  [yellow]katana headless en échec (code {rc}{' : ' + detail if detail else ''}) — résultats du "
+                "crawl standard conservés (Chrome/Chromium installé ? voir README)[/yellow]"
+            )
+        merged = write_lines(paths["katana"], read_lines(paths["katana"]) + (read_lines(raw) if ok else []))
+    finally:
+        raw.unlink(missing_ok=True)
+    if ok:
+        ctx.log(f"  [dim]fusion standard + headless → {merged} entrées · {paths['katana'].name}[/dim]")
+        if o.katana_store:
+            ctx.log("  [dim]katana ne stocke pas les réponses en headless : jsluice et secrets ne voient que le crawl standard[/dim]")
+    return [f"{len(hosts)} hôtes headless" if ok else f"headless en échec (code {rc})"]
 
 
 def _stored_responses(ctx: Context, stage: str) -> List[surface.StoredResponse]:
@@ -1701,6 +1906,7 @@ def build_modules(o: Options) -> List[Module]:
     uf_mode = "toutes sources (-all)" if o.urlfinder_all else "sources curées"
     icon = STAGE_ICONS.get
     timeout = o.module_timeout
+    on = o.module_on
     return [
         Module(
             "subfinder", [], run_subfinder,
@@ -1713,15 +1919,15 @@ def build_modules(o: Options) -> List[Module]:
         ),
         # Sources de sous-domaines sans dépendance : elles tournent en parallèle de subfinder.
         Module(
-            "crtsh", [], run_crtsh, enabled=o.crtsh, timeout=timeout("crtsh"),
+            "crtsh", [], run_crtsh, enabled=o.crtsh and on("crtsh"), timeout=timeout("crtsh"),
             icon=icon("crtsh", "•"), desc="sous-domaines des certificats (crt.sh, sans binaire)",
         ),
         Module(
-            "amass", [], run_amass, binaries=["amass"], enabled=o.amass, timeout=timeout("amass"),
+            "amass", [], run_amass, binaries=["amass"], enabled=o.amass and on("amass"), timeout=timeout("amass"),
             icon=icon("amass", "•"), desc="sous-domaines · amass enum passif",
         ),
         Module(
-            "subdomains", ["subfinder", "crtsh", "amass"], run_subdomains,
+            "subdomains", ["subfinder", "crtsh", "amass"], run_subdomains, enabled=on("subdomains"),
             icon=icon("subdomains", "•"), desc="fusion subfinder + crtsh + amass · périmètre",
         ),
         Module(
@@ -1738,11 +1944,11 @@ def build_modules(o: Options) -> List[Module]:
         # publiques (Wayback, CommonCrawl), déjà rate-limitées par IP. Chacune démarre quand
         # la précédente est terminée, mais toute la chaîne tourne en parallèle des hôtes.
         Module(
-            "gau", ["urlfinder"], run_gau, binaries=["gau"], enabled=o.gau, timeout=timeout("gau"),
+            "gau", ["urlfinder"], run_gau, binaries=["gau"], enabled=o.gau and on("gau"), timeout=timeout("gau"),
             icon=icon("gau", "•"), desc="URLs d'archives (gau) · après urlfinder",
         ),
         Module(
-            "waybackurls", ["gau"], run_waybackurls, binaries=["waybackurls"], enabled=o.waybackurls,
+            "waybackurls", ["gau"], run_waybackurls, binaries=["waybackurls"], enabled=o.waybackurls and on("waybackurls"),
             timeout=timeout("waybackurls"), icon=icon("waybackurls", "•"),
             desc="URLs de la Wayback Machine · après gau",
         ),
@@ -1754,74 +1960,78 @@ def build_modules(o: Options) -> List[Module]:
         # nuclei1 AVANT katana : quand les deux deviennent prêts dans le même tour de
         # l'ordonnanceur, nuclei1 prend son budget d'abord (50 req/s) et katana
         # reçoit le reste (150 -> 100). Désactivé (sans -n) : aucun budget consommé.
+        # Budget (--max-rps 150) : httpx 150 seul au départ ; puis katana 100 (+ nuclei #1 50 avec -n).
+        # Sans -n, les 50 req/s restants vont à takeover (10) et naabu (40 sur 100 demandés) pendant le crawl.
         Module(
-            "nuclei1", ["httpx"], run_nuclei1, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(1),
+            "nuclei1", ["httpx"], run_nuclei1, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(1) and on("nuclei1"),
             network=True, rate=o.nuclei_rate_limit, timeout=timeout("nuclei1"), label="nuclei #1",
             icon=icon("nuclei1", "•"), desc=f"passe 1 · par hôte · mode {o.nuclei_mode} (‖ katana)",
         ),
         Module(
             "katana", ["httpx"], run_katana, binaries=["katana"], enabled=not o.skip_katana,
-            network=True, rate=o.rate_limit, timeout=timeout("katana"),
+            network=True, rate=o.katana_rate_limit, timeout=timeout("katana"),
             icon=icon("katana", "•"),
             desc="crawl actif depuis les seeds vivantes" + (" · réponses stockées" if o.katana_store else ""),
         ),
         # Déclarés APRÈS katana : à budget égal le crawl garde la priorité (nuclei 50 + katana 100) ;
-        # takeover et naabu prennent ce qui reste et attendent sinon.
+        # takeover et naabu prennent ce qui reste (50 sans -n) et attendent sinon.
         Module(
-            "takeover", ["dnsx"], run_takeover, binaries=["dnsx"], enabled=o.takeover,
+            # Dépend aussi de httpx : sinon il démarre avant httpx #1 (chemin critique)
+            # et lui prend du budget de débit.
+            "takeover", ["dnsx", "httpx"], run_takeover, binaries=["dnsx"], enabled=o.takeover and on("takeover"),
             network=True, rate=o.takeover_rate, timeout=timeout("takeover"),
             icon=icon("takeover", "•"), desc="CNAME hors périmètre (dnsx) + subzy sur ces seuls candidats",
         ),
         Module(
-            "naabu", ["dnsx"], run_naabu, binaries=["naabu"], enabled=o.naabu,
+            "naabu", ["dnsx", "httpx"], run_naabu, binaries=["naabu"], enabled=o.naabu and on("naabu"),
             network=True, rate=o.naabu_rate, timeout=timeout("naabu"),
             icon=icon("naabu", "•"), desc=f"ports des hôtes vivants · {o.ports} · -exclude-cdn",
         ),
         Module(
             "httpx_ports", ["naabu"], run_httpx_ports, binaries=["httpx"],
-            enabled=o.httpx_ports and not o.skip_httpx,
+            enabled=o.httpx_ports and not o.skip_httpx and on("httpx_ports"),
             network=True, rate=o.httpx_ports_rate, timeout=timeout("httpx_ports"), label="httpx ports",
             icon=icon("httpx_ports", "•"), desc="services web hors 80/443 trouvés par naabu",
         ),
         Module(
             "nuclei_ports", ["httpx_ports"], run_nuclei_ports, binaries=["nuclei"],
-            enabled=o.nuclei_pass_enabled(1), network=True, rate=o.nuclei_rate_limit,
+            enabled=o.nuclei_pass_enabled(1) and on("nuclei_ports"), network=True, rate=o.nuclei_rate_limit,
             timeout=timeout("nuclei_ports"), label="nuclei ports",
             icon=icon("nuclei_ports", "•"), desc=f"réglages passe 1 · services hors 80/443 · mode {o.nuclei_mode}",
         ),
         Module(
-            "jsluice", ["katana"], run_jsluice, binaries=["jsluice"], enabled=o.jsluice,
+            "jsluice", ["katana"], run_jsluice, binaries=["jsluice"], enabled=o.jsluice and on("jsluice"),
             timeout=timeout("jsluice"), icon=icon("jsluice", "•"),
             desc="endpoints et secrets des JS stockés par katana (hors ligne)",
         ),
         Module(
             "secrets", ["katana", "jsluice"], run_secrets, binaries_any=["trufflehog", "gitleaks"],
-            enabled=o.secrets, timeout=timeout("secrets"), icon=icon("secrets", "•"),
+            enabled=o.secrets and on("secrets"), timeout=timeout("secrets"), icon=icon("secrets", "•"),
             desc="secrets des réponses stockées · trufflehog --no-verification (sinon gitleaks)",
         ),
         Module(
             "merge_map", ["katana", "gau", "waybackurls", "jsluice"], run_merge_map,
-            icon=icon("merge_map", "•"), desc="carte finale (seeds + crawl + archives + JS) + périmètre strict",
+            enabled=on("merge_map"), icon=icon("merge_map", "•"), desc="carte finale (seeds + crawl + archives + JS) + périmètre strict",
         ),
         # Valide aussi les URLs d'archive et de JS (jamais testées avant) : actif même sans katana.
         # Attend httpx_ports : les services hors 80/443 rejoignent les listes finales.
         Module(
             "httpx2", ["merge_map", "httpx_ports"], run_httpx2, binaries=["httpx"],
-            enabled=o.revalidate and not o.skip_httpx,
+            enabled=o.revalidate and not o.skip_httpx and on("httpx2"),
             network=True, rate=o.rate_limit, timeout=timeout("httpx2"), label="httpx #2",
             icon=icon("httpx2", "•"), desc="validation des URLs de la carte absentes d'httpx #1",
         ),
         Module(
-            "tree", ["httpx2"], run_tree, enabled=o.tree_report,
+            "tree", ["httpx2"], run_tree, enabled=o.tree_report and on("tree"),
             icon=icon("tree", "•"), desc="arbre HTML interactif des 200",
         ),
         Module(
-            "arjun", ["httpx2"], run_arjun, binaries=["arjun"], enabled=o.arjun,
+            "arjun", ["httpx2"], run_arjun, binaries=["arjun"], enabled=o.arjun and on("arjun"),
             network=True, rate=o.arjun_rate, timeout=timeout("arjun"),
             icon=icon("arjun", "•"), desc=f"paramètres cachés · ≤ {o.arjun_max} URLs représentatives",
         ),
         Module(
-            "nuclei2", ["httpx2", "arjun"], run_nuclei2, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(2),
+            "nuclei2", ["httpx2", "arjun"], run_nuclei2, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(2) and on("nuclei2"),
             network=True, rate=o.nuclei2_rate_limit, timeout=timeout("nuclei2"), label="nuclei #2",
             icon=icon("nuclei2", "•"), desc=f"passe 2 · URLs représentantes (K={o.nuclei_k}) · DAST + exposition",
         ),

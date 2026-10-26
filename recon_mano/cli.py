@@ -19,6 +19,9 @@ total vers la cible (budget global partagé par httpx, katana, takeover, naabu, 
 `run_config.json` (périmètre, codes) et `run_stats.json` (durées par module).
 Tout est actif par défaut sauf nuclei (`-n`, jamais par défaut), qui tourne en deux
 passes : par hôte pendant le crawl, puis par URL représentative en fin de pipeline.
+Les modules actifs viennent d'un preset (`config.PRESETS`, `full` pour l'instant), ajusté par
+`--enable` / `--disable` puis par les options par module (`--no-gau`, `--skip-httpx`…) : voir
+`config.resolve_modules`.
 
 Invocation minimale::
 
@@ -49,7 +52,15 @@ from .io_utils import count_lines
 from .liveness import DEFAULT_LIVE_CODES, parse_codes
 from .merge import merge_folder
 from .findings import severity_line
-from .config import MODULE_DEFAULTS, default_param, default_timeout_minutes, parse_module_timeouts
+from .config import (
+    MODULE_DEFAULTS,
+    NUCLEI_MODULES,
+    default_param,
+    default_timeout_minutes,
+    parse_module_names,
+    parse_module_timeouts,
+    resolve_modules,
+)
 from .surface import port_flags
 from .modules import (  # noqa: F401 — ré-exportés pour compatibilité
     DEFAULT_MATCH_CODES,
@@ -80,11 +91,26 @@ from .ui import (  # noqa: F401
 
 REQUIRED_TOOLS = ["subfinder", "dnsx", "httpx", "urlfinder", "katana"]
 
+# Option par module -> module du registre. Une option donnée EXPLICITEMENT sur la ligne de commande
+# l'emporte sur --enable / --disable et sur le preset ; les --skip-X sont des alias de --no-X.
+MODULE_FLAGS = {
+    "crtsh": "crtsh", "amass": "amass", "gau": "gau", "waybackurls": "waybackurls", "jsluice": "jsluice",
+    "secrets": "secrets", "takeover": "takeover", "naabu": "naabu", "httpx_ports": "httpx_ports",
+    "arjun": "arjun", "revalidate": "httpx2", "tree_report": "tree",
+}
+SKIP_FLAGS = {
+    "skip_subfinder": "subfinder", "skip_dnsx": "dnsx", "skip_urlfinder": "urlfinder",
+    "skip_httpx": "httpx", "skip_katana": "katana",
+}
+HEADLESS_MODES = ("auto", "off", "all")
+SANDBOX_MODES = ("auto", "on", "off")
+
 # Anciens fichiers qu'un --clean doit aussi emporter (nuclei mono-passe, avant les deux passes)
 # et le fichier temporaire de waybackurls (laissé par un run interrompu).
 LEGACY_ARTIFACTS = [
     "07_nuclei_input.txt", ".waybackurls_domains.tmp",
     ".jsluice_files.tmp", ".jsluice_urls.tmp", ".secrets.tmp", ".subzy.tmp",
+    ".katana_headless.tmp",
 ]
 
 # Outils optionnels : (binaire, module qu'il active, ce qui se passe sans lui).
@@ -240,6 +266,7 @@ def run_merge_command(path_arg: Optional[Path]) -> None:
 
 
 def main(
+    click_ctx: typer.Context,
     target: Optional[str] = typer.Argument(None, help="Domaine apex, ou 'report' / 'merge' (sous-commandes sur un dossier de sortie)"),
     output: Optional[Path] = typer.Argument(None, help="Dossier de sortie (ou dossier/fichier si target=report, dossier si target=merge)"),
     check: bool = typer.Option(False, "--check", help="Vérifie la présence des outils puis quitte"),
@@ -301,6 +328,31 @@ def main(
         help="katana -store-response : garde les réponses brutes dans <sortie>/responses/katana (index.txt + un fichier par "
              "réponse ; plusieurs centaines de Mo sur un gros crawl, borné par --katana-max-pages). jsluice et secrets en "
              "dépendent : sans elle ils sont ignorés.",
+    ),
+    katana_rate_limit: int = typer.Option(
+        MODULE_DEFAULTS["katana"].rate, "--katana-rate-limit", min=1,
+        help="katana -rate-limit demandé (req/s, plafonné par --max-rps ; défaut 100). Volontairement sous --rate-limit (150) : "
+             "les 50 req/s restants servent takeover / naabu / httpx ports PENDANT le crawl (avec -n : nuclei #1 50 + katana 100).",
+    ),
+    katana_dedupe_hosts: bool = typer.Option(
+        default_param("katana", "dedupe_hosts"), "--katana-dedupe-hosts/--no-katana-dedupe-hosts",
+        help="Avant katana, ne garde qu'un hôte par empreinte de contenu de sa racine (httpx -hash sha256 + code + taille) : "
+             "40 sous-domaines servant la même page ne sont crawlés qu'une fois. Les écartés vont dans 06_katana_dedup.tsv ; "
+             "les livrables gardent tous les hôtes.",
+    ),
+    katana_headless: str = typer.Option(
+        default_param("katana", "headless"), "--katana-headless",
+        help="Crawl katana -headless (Chrome) : auto (défaut : seulement les hôtes à framework JS détectés par httpx — React, "
+             "Next.js, Vue.js, Angular…) | off | all. Second crawl dans le même module ; s'il échoue, le crawl standard est gardé. "
+             "Katana ne stocke pas les réponses en headless.",
+    ),
+    katana_headless_concurrency: int = typer.Option(
+        default_param("katana", "headless_concurrency"), "--katana-headless-concurrency", min=1,
+        help="Concurrence du crawl headless (défaut 3 : un navigateur par fetcher, bien plus lourd qu'un fetch HTTP)",
+    ),
+    katana_no_sandbox: str = typer.Option(
+        default_param("katana", "no_sandbox"), "--katana-no-sandbox",
+        help="katana -no-sandbox en headless : auto (défaut : si le processus tourne en root, ex. Kali) | on | off",
     ),
     jsluice: bool = typer.Option(
         MODULE_DEFAULTS["jsluice"].enabled, "--jsluice/--no-jsluice",
@@ -380,10 +432,22 @@ def main(
         help="arjun --stable : 1 thread et 3 à 9 s de pause par requête. Désactivé par défaut (module inutilisable de lenteur) ; "
              "le débit est de toute façon borné par --arjun-rate.",
     ),
+    enable: str = typer.Option(
+        "", "--enable",
+        help="Modules à activer en plus du preset (virgules, noms du registre : " + ", ".join(MODULE_DEFAULTS) + "). "
+             "Précédence : option par module (--no-gau, --skip-httpx…) > --enable/--disable > preset. "
+             "Les modules nuclei exigent -n (erreur sinon).",
+    ),
+    disable: str = typer.Option(
+        "", "--disable",
+        help="Modules à désactiver (virgules, mêmes noms) ; les --skip-X en sont des alias. Un module de plomberie "
+             "(subdomains, merge_map) ne peut pas être désactivé tant qu'un module qui en dépend est actif.",
+    ),
     module_timeout: List[str] = typer.Option(
         [], "--module-timeout",
         help="Timeout d'un module, en minutes : nom=minutes (répétable, 0 = illimité), ex. --module-timeout katana=30. "
-             "Prioritaire sur les options dédiées. Modules : " + ", ".join(MODULE_DEFAULTS),
+             "Prioritaire sur les options dédiées. Modules : " + ", ".join(MODULE_DEFAULTS) + ". À savoir : -ct "
+             "(--katana-duration) s'applique PAR SEED ; ce timeout borne le module katana entier.",
     ),
     subdomains: str = typer.Option(
         "", "--subdomains",
@@ -404,7 +468,7 @@ def main(
     scope: str = typer.Option("rdn", "--scope", help="katana -fs : rdn, fqdn, dn ou regex"),
     js_crawl: bool = typer.Option(False, "--js-crawl", help="katana -jc (endpoints JS, non validés)"),
     katana_max_pages: int = typer.Option(3000, "--katana-max-pages", help="Plafond pages/domaine katana (-mdp). 0 = illimité"),
-    katana_duration: str = typer.Option("10m", "--katana-duration", help="Durée max du crawl katana (-ct, ex: 10m). Vide = illimité"),
+    katana_duration: str = typer.Option("10m", "--katana-duration", help="Durée max du crawl katana PAR SEED (-ct, ex: 10m ; pas pour tout le run : borner le module avec --module-timeout katana=…). Vide = illimité"),
     katana_ignore_query: bool = typer.Option(False, "--katana-ignore-query", help="katana -iqp : collapse les variantes de query params"),
     katana_filter_similar: bool = typer.Option(
         True, "--katana-filter-similar/--no-katana-filter-similar", help="katana -fsu : collapse les chemins similaires (/x/1../x/900)"
@@ -413,7 +477,7 @@ def main(
     urlfinder_retries: int = typer.Option(1, "--urlfinder-retries", help="Réessais si urlfinder rend 0 (sources rate-limitées)"),
     urlfinder_retry_wait: int = typer.Option(30, "--urlfinder-retry-wait", help="Base du délai entre essais urlfinder, en s (progressif ×n)"),
     threads: int = typer.Option(default_param("httpx", "threads"), "--threads", help="Threads httpx"),
-    rate_limit: int = typer.Option(MODULE_DEFAULTS["httpx"].rate, "--rate-limit", help="Requêtes/seconde demandées par httpx et katana (plafonnées par --max-rps)"),
+    rate_limit: int = typer.Option(MODULE_DEFAULTS["httpx"].rate, "--rate-limit", help="Requêtes/seconde demandées par httpx #1 et #2 (plafonnées par --max-rps) ; katana a son propre --katana-rate-limit"),
     concurrency: int = typer.Option(default_param("katana", "concurrency"), "--concurrency", help="Concurrence katana"),
     httpx_bin: Optional[str] = typer.Option(None, "--httpx-bin", help="Chemin du httpx ProjectDiscovery"),
     revalidate: bool = typer.Option(
@@ -568,6 +632,50 @@ def main(
         console.print("[bold red]--live-codes :[/bold red] codes HTTP séparés par des virgules (ex: 200,301,403)")
         raise typer.Exit(code=2)
 
+    if katana_headless not in HEADLESS_MODES:
+        console.print(f"[bold red]--katana-headless :[/bold red] {' | '.join(HEADLESS_MODES)}")
+        raise typer.Exit(code=2)
+    if katana_no_sandbox not in SANDBOX_MODES:
+        console.print(f"[bold red]--katana-no-sandbox :[/bold red] {' | '.join(SANDBOX_MODES)}")
+        raise typer.Exit(code=2)
+
+    # --- Modules actifs : preset, puis --enable / --disable, puis options par module ------------- #
+    # Plus tard : `--mode fast|surface|full` -> `preset = mode` (resolve_modules gère déjà les trois ;
+    # surface n'a aucun module nuclei, même avec -n).
+    preset = "full"
+    def explicit(name: str) -> bool:
+        # Comparaison par nom : selon la version, Typer embarque son propre click (ParameterSource distinct).
+        source = click_ctx.get_parameter_source(name)
+        return source is not None and source.name == "COMMANDLINE"
+
+    given = {
+        "crtsh": crtsh, "amass": amass, "gau": gau, "waybackurls": waybackurls, "jsluice": jsluice,
+        "secrets": secrets, "takeover": takeover, "naabu": naabu, "httpx_ports": httpx_ports, "arjun": arjun,
+        "revalidate": revalidate, "tree_report": tree_report,
+    }
+    skips = {
+        "skip_subfinder": skip_subfinder, "skip_dnsx": skip_dnsx, "skip_urlfinder": skip_urlfinder,
+        "skip_httpx": skip_httpx, "skip_katana": skip_katana,
+    }
+    flags = {MODULE_FLAGS[opt]: value for opt, value in given.items() if explicit(opt)}
+    flags.update({SKIP_FLAGS[opt]: False for opt, value in skips.items() if value})
+    try:
+        resolved = resolve_modules(
+            preset, parse_module_names(enable, "--enable"), parse_module_names(disable, "--disable"), nuclei, flags,
+        )
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=2)
+    crtsh, amass, gau, waybackurls = resolved["crtsh"], resolved["amass"], resolved["gau"], resolved["waybackurls"]
+    jsluice, secrets, takeover, naabu = resolved["jsluice"], resolved["secrets"], resolved["takeover"], resolved["naabu"]
+    httpx_ports, arjun, revalidate, tree_report = resolved["httpx_ports"], resolved["arjun"], resolved["httpx2"], resolved["tree"]
+    skip_subfinder, skip_dnsx, skip_urlfinder = not resolved["subfinder"], not resolved["dnsx"], not resolved["urlfinder"]
+    skip_httpx, skip_katana = not resolved["httpx"], not resolved["katana"]
+    nuclei_requested = nuclei
+    nuclei = any(resolved[name] for name in NUCLEI_MODULES)    # famille nuclei réellement active
+    if nuclei_requested and not nuclei:
+        console.print("[yellow]-n sans effet : aucun module nuclei dans ce jeu de modules (preset / --disable).[/yellow]")
+
     # --- Questions : UNIQUEMENT ici, au lancement ---------------------------- #
     # Aucune invite pendant l'exécution (elle se battrait avec le board live et
     # les autres threads) ; seulement en terminal interactif et sans -y.
@@ -610,7 +718,9 @@ def main(
         crtsh=crtsh, crtsh_timeout=crtsh_timeout, crtsh_retries=crtsh_retries,
         amass=amass, gau=gau, gau_threads=gau_threads, waybackurls=waybackurls,
         archive_dedupe=archive_dedupe, archive_k=archive_k, timeouts=timeouts,
-        katana_store=katana_store, jsluice=jsluice, secrets=secrets,
+        katana_store=katana_store, katana_rate_limit=katana_rate_limit, katana_dedupe_hosts=katana_dedupe_hosts,
+        katana_headless=katana_headless, katana_headless_concurrency=katana_headless_concurrency,
+        katana_no_sandbox=katana_no_sandbox, modules=resolved, jsluice=jsluice, secrets=secrets,
         takeover=takeover, takeover_rate=takeover_rate, takeover_concurrency=takeover_concurrency,
         naabu=naabu, naabu_rate=naabu_rate, ports=ports, naabu_allow_full=naabu_allow_full,
         httpx_ports=httpx_ports, httpx_ports_rate=httpx_ports_rate,
@@ -640,6 +750,11 @@ def main(
             scan_bits.append(f"exclu {','.join(scope_excludes)}")
     else:
         scan_bits.append("scope off")
+    if not skip_katana:
+        scan_bits.append(
+            f"katana {katana_rate_limit}/s · headless {katana_headless}"
+            f"{'' if katana_dedupe_hosts else ' · sans dédoublonnage'}"
+        )
     scan_bits.append(f"{workers} worker{'s' if workers > 1 else ''} · {max_rps} rps max")
     print_banner([("🎯 cible ", target), ("📁 sortie", str(output)), ("⚙️  config", " · ".join(scan_bits))])
 
@@ -670,8 +785,13 @@ def main(
         "scope": {"enabled": scope_enabled, "apexes": scope_apexes, "excludes": scope_excludes},
         "live_codes": sorted(live_code_set),
         "match_codes": match_codes,
+        "preset": preset,
         "modules": [m.name for m in modules if m.enabled],
         "surface": {"ports": ports, "katana_store": katana_store, "arjun_max": arjun_max},
+        "katana": {
+            "rate_limit": katana_rate_limit, "dedupe_hosts": katana_dedupe_hosts, "headless": katana_headless,
+            "headless_concurrency": katana_headless_concurrency,
+        },
         "archive": {"dedupe": archive_dedupe, "k": archive_k},
         "timeouts": {name: seconds for name, seconds in sorted(timeouts.items())},
         "nuclei": {

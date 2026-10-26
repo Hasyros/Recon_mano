@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 from .io_utils import count_lines, read_lines, write_lines
 from .signatures import host_port
@@ -177,3 +178,104 @@ def clean_live_urls(urls_all_file: Path, fallback_file: Path) -> List[str]:
     else:
         raw = read_lines(fallback_file)
     return [u for u in raw if u.startswith(("http://", "https://"))]
+
+
+# --------------------------------------------------------------------------- #
+# Seeds de katana : hôtes identiques (empreinte de contenu) et hôtes à framework JS
+# --------------------------------------------------------------------------- #
+
+# Technologies (nom httpx -tech-detect, casse ignorée, version `Nom:1.2` retirée) qui font d'un hôte
+# une application JavaScript : un crawl sans navigateur n'y voit presque rien.
+JS_FRAMEWORKS = frozenset({
+    "react", "next.js", "vue.js", "nuxt.js", "angular", "angularjs", "svelte", "sveltekit", "ember.js",
+    "backbone.js", "gatsby", "remix", "preact", "solidjs", "qwik", "meteor",
+})
+
+
+def tech_names(tech: Iterable[Any]) -> List[str]:
+    """Noms de technologies normalisés (minuscules, sans version) d'un champ `tech` httpx."""
+    return [str(item).split(":", 1)[0].strip().lower() for item in tech or [] if str(item).strip()]
+
+
+def js_frameworks(tech: Iterable[Any]) -> List[str]:
+    """Frameworks JS présents dans un champ `tech` (noms normalisés, dans l'ordre)."""
+    return [name for name in tech_names(tech) if name in JS_FRAMEWORKS]
+
+
+def js_heavy_hosts(rows: Iterable[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """`hôte[:port]` -> frameworks JS détectés (union des lignes httpx de l'hôte)."""
+    found: Dict[str, List[str]] = {}
+    for row in rows:
+        key = host_port(str(row.get("url") or row.get("input") or ""))
+        tech = row.get("tech")
+        if not key or not isinstance(tech, list):
+            continue
+        for name in js_frameworks(tech):
+            if name not in found.setdefault(key, []):
+                found[key].append(name)
+    return {host: names for host, names in found.items() if names}
+
+
+def row_fingerprint(row: Dict[str, Any]) -> str:
+    """Empreinte du contenu d'une réponse httpx lancée avec `-hash sha256` : `sha256[:16]/code/taille`.
+
+    Vide (= non comparable) si la ligne n'a pas de hash, ou si le corps est vide : une page vide
+    ne dit rien de l'hôte, deux API qui répondent « rien » à la racine ne sont pas la même appli."""
+    hashes = row.get("hash")
+    digest = str(hashes.get("body_sha256") or "") if isinstance(hashes, dict) else ""
+    length = row.get("content_length")
+    if not digest or length == 0:
+        return ""
+    return f"{digest[:16]}/{row.get('status_code', '-')}/{length if length is not None else '-'}"
+
+
+def _is_root(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return parts.path in ("", "/") and not parts.query
+
+
+def host_fingerprints(seeds: Iterable[str], rows: Iterable[Dict[str, Any]]) -> Dict[str, str]:
+    """`hôte[:port]` -> empreinte, pour chaque hôte ayant des seeds (ordre des seeds). La ligne
+    retenue est celle de la racine de l'hôte, sinon la première ligne de l'hôte ; "" si aucune
+    ligne exploitable (l'hôte n'est alors jamais regroupé)."""
+    by_url: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        for key in row_keys(row):
+            by_url.setdefault(key, row)
+    urls_by_host: Dict[str, List[str]] = {}
+    for url in seeds:
+        urls_by_host.setdefault(host_port(url), []).append(url)
+    result: Dict[str, str] = {}
+    for host, urls in urls_by_host.items():
+        candidates = [by_url[u] for u in urls if u in by_url]
+        chosen = next((r for r in candidates if _is_root(str(r.get("url") or r.get("input") or ""))), None)
+        if chosen is None and candidates:
+            chosen = candidates[0]
+        result[host] = row_fingerprint(chosen) if chosen is not None else ""
+    return result
+
+
+def dedupe_seed_hosts(
+    seeds: List[str], rows: Iterable[Dict[str, Any]]
+) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    """Seeds de katana sans les hôtes qui servent le même contenu qu'un hôte déjà gardé.
+
+    Les hôtes d'une même empreinte (voir `host_fingerprints`) forment un groupe ; seuls les seeds du
+    premier hôte du groupe (ordre des seeds) sont gardés. Retourne (seeds gardés, [(hôte gardé,
+    hôte écarté, empreinte)]). Ne touche à aucun livrable : ne sert qu'à choisir ce que katana crawle."""
+    fingerprints = host_fingerprints(seeds, rows)
+    first: Dict[str, str] = {}
+    dropped_hosts: Dict[str, Tuple[str, str]] = {}
+    for host, fingerprint in fingerprints.items():
+        if not fingerprint:
+            continue
+        if fingerprint in first:
+            dropped_hosts[host] = (first[fingerprint], fingerprint)
+        else:
+            first[fingerprint] = host
+    kept = [url for url in seeds if host_port(url) not in dropped_hosts]
+    dropped = [(kept_host, host, fp) for host, (kept_host, fp) in dropped_hosts.items()]
+    return kept, dropped

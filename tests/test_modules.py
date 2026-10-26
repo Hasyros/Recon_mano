@@ -401,8 +401,8 @@ def test_nuclei_is_opt_in(tmp_path, monkeypatch):
         assert "option" in scheduler.records[name].note
     assert "nuclei" not in tools.calls and finalize_nuclei(ctx) is None
     assert not (tmp_path / "nuclei.txt").exists()
-    # Sans -n : katana a tout le budget, httpx garde sa commande d'avant (pas de -cdn).
-    assert scheduler.records["katana"].rate == 150
+    # Sans -n : katana demande 100 (les 50 restants servent aux autres modules), httpx garde sa commande d'avant (pas de -cdn).
+    assert scheduler.records["katana"].rate == 100
     assert all("-cdn" not in command for _, command in tools.commands)
 
 
