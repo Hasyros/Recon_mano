@@ -13,6 +13,7 @@ les rejets dans un TSV (`rejected_scope.tsv`) pour garder la trace de ce qui a
 from __future__ import annotations
 
 import re
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -132,7 +133,11 @@ class ScopeFilter:
     - `enabled=False` (--no-scope-filter) : rien n'est filtré ni journalisé.
 
     Le journal est remis à zéro à la création (un run = un journal) ; en mode
-    désactivé, un journal périmé d'un run précédent est supprimé.
+    désactivé, un journal périmé d'un run précédent est supprimé. `reset_log=False`
+    (rejeu `merge`) conserve le journal existant et y ajoute.
+
+    Utilisable depuis plusieurs threads (modules en parallèle) : comptage et
+    journal sont protégés par un verrou.
     """
 
     def __init__(
@@ -141,13 +146,16 @@ class ScopeFilter:
         excludes: Domains = (),
         reject_log: Optional[Path] = None,
         enabled: bool = True,
+        reset_log: bool = True,
     ) -> None:
         self.apexes = _as_domains(apexes)
         self.excludes = _as_domains(excludes)
         self.reject_log = reject_log
         self.enabled = enabled
         self.rejected: Dict[str, int] = defaultdict(int)
-        self._reset_log()
+        self._lock = threading.Lock()
+        if reset_log:
+            self._reset_log()
 
     def _reset_log(self) -> None:
         if self.reject_log is None:
@@ -193,8 +201,9 @@ class ScopeFilter:
             else:
                 rejects.append((host, line))
         if rejects:
-            self.rejected[stage] += len(rejects)
-            self._log(stage, rejects)
+            with self._lock:
+                self.rejected[stage] += len(rejects)
+                self._log(stage, rejects)
         return kept
 
     def filter_file(self, path: Path, stage: str) -> Tuple[int, int]:

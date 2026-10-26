@@ -21,6 +21,9 @@ cible ─┬─ subfinder → dnsx (-wd) ── hôtes ──┐
                                                [--nuclei] (opt-in)
 ```
 
+Les étapes s'exécutent en parallèle quand leurs dépendances le permettent (voir
+[Exécution parallèle](#exécution-parallèle)).
+
 **httpx #2** est essentiel : katana découvre des URLs par crawl mais ne connaît
 pas leur code HTTP. La revalidation donne les statuts réels et **`urls_200_final.txt`**
 = tous les 200 (archives *et* découvertes katana). L'arbre `urls_tree.html` est
@@ -47,6 +50,85 @@ On le ré-applique à chaque fois qu'on génère des URLs depuis une source non
 vivante. La sortie urlfinder est historique : sans ce filtre, on sèmerait katana
 avec des milliers d'URLs mortes.
 
+## Exécution parallèle
+
+Chaque étape est un **module** indépendant ; un ordonnanceur lance un module dès
+que toutes ses dépendances sont *terminées* (réussies, en échec, en timeout,
+ignorées ou désactivées — c'est le module qui gère ses entrées manquantes et ses
+replis). Deux modules sans lien de dépendance tournent en même temps :
+
+```
+subfinder ── dnsx ──┐
+                    ├─ httpx ── katana ── merge_map ── httpx #2 ─┬─ tree
+urlfinder ──────────┘                                            └─ nuclei (opt-in)
+```
+
+| Module | Dépend de | Rôle |
+|---|---|---|
+| `subfinder` | — | Sous-domaines (ou liste `--subdomains`) |
+| `dnsx` | subfinder | Résolution DNS, wildcards filtrés |
+| `urlfinder` | — | Archives, depuis l'apex seul : tourne **en parallèle** de subfinder + dnsx |
+| `httpx` | dnsx, urlfinder | Fusion des hôtes et des URLs d'archive, une passe |
+| `katana` | httpx | Crawl des seeds vivantes |
+| `merge_map` | katana | `all_urls.txt` = seeds vivantes + crawl, périmètre strict (léger, sans réseau) |
+| `httpx2` | merge_map | Revalidation de la carte |
+| `tree` | httpx2 | `urls_tree.html` |
+| `nuclei` | httpx2 | Opt-in (`-n`) |
+
+- **`--workers N`** (défaut 4) : nombre maximum de modules simultanés.
+  **`--sequential`** = `--workers 1` (un seul module à la fois, ordre historique) —
+  pratique pour déboguer ou comparer.
+- **`--max-rps N`** (défaut 150) : budget de débit **global**. `--rate-limit` et
+  `--nuclei-rate-limit` ne sont plus que des débits *demandés* ; la somme des débits
+  accordés aux modules qui frappent la cible (httpx, katana, nuclei) ne dépasse
+  jamais `--max-rps`. Le budget est global parce que c'est la cible qui encaisse
+  le trafic cumulé, pas chaque outil : deux modules à 150 req/s en parallèle font
+  300 req/s côté serveur, ce qui déclenche WAF et bans. Un module reçoit
+  `min(demandé, budget restant)` au démarrage ; s'il reste moins de
+  `min(demandé, 10)`, il attend qu'un autre module libère du budget. Les modules
+  qui n'attaquent pas la cible (subfinder, dnsx, urlfinder, merge_map, tree) n'en
+  consomment pas. Pour dépasser 150 req/s, relever `--max-rps` en même temps que
+  `--rate-limit`.
+- **Binaire manquant** : le module est `désactivé` (« binaire X introuvable »), le
+  reste du pipeline continue avec ses replis (ex. sans dnsx, httpx part de la
+  liste subfinder). **Exception dans un module** : `échec`, message dans le
+  récapitulatif (traceback complet avec `-v`), les modules indépendants finissent.
+  Si subfinder ne rend aucun hôte en périmètre, il est en échec et tout l'aval
+  est ignoré proprement (code retour 1).
+- **katana ne crawle que du confirmé vivant** : si httpx n'a trouvé aucune URL
+  vivante, katana est *ignoré* (jamais de crawl de cibles non confirmées). Le repli
+  sur les entrées brutes fusionnées n'existe que pour `--skip-httpx`.
+- **Aucune question pendant l'exécution** : périmètre et cibles nuclei
+  (`hôtes vivants` / `toutes les URLs vivantes`) sont demandés au lancement ;
+  `-y`, `--in-scope` et `--nuclei-targets` évitent les questions, hors terminal
+  les cibles nuclei valent « hôtes ».
+- **Affichage** : un board live (une ligne par module : état, lignes écrites, temps,
+  débit accordé) ; chaque module imprime son bloc de détails à sa fin, puis un
+  récapitulatif final avec une ligne par module (✓ terminé · ✗ échec · ⏱ timeout ·
+  – ignoré · ⊘ désactivé) et la durée réelle face au cumul des modules. Avec `-v`,
+  pas de board : flux des outils préfixé `outil │` et heartbeat.
+- **`run_stats.json`** : par module, statut, début/fin (décalage en s), durée,
+  résultat, débit accordé, note ; plus `wall_clock` (durée réelle),
+  `sum_of_durations` (cumul) et `parallel_gain` (cumul − durée réelle).
+- **`run_config.json`** : cible, périmètre (apex, exclusions, filtre actif), codes
+  vivants / `--match-codes`, modules activés, versions (paquet, Python).
+
+### `recon_mano merge` : rejouer la fusion
+
+```bash
+recon_mano merge sortie
+```
+
+Reconstruit, **sans lancer aucun outil**, la fin de la chaîne à partir des
+fichiers déjà présents : `all_urls.txt` (seeds `urls_live.txt` + `06_katana.txt`,
+périmètre strict), `urls_all_final.txt` / `urls_200_final.txt` /
+`urls_live_final.txt` (depuis `08_httpx2.jsonl`, sinon `05_httpx.jsonl`) et
+`urls_tree.html`. Le périmètre et les codes vivants viennent de `run_config.json`
+(à défaut : périmètre déduit du nom du dossier, codes par défaut). Utile après
+avoir ajouté une exclusion à `run_config.json`, édité une liste à la main ou
+relancé un seul module. Les rejets du rejeu sont ajoutés à `rejected_scope.tsv`
+sous l'étape `merge`.
+
 ## Sorties
 
 | Fichier | Contenu |
@@ -68,6 +150,8 @@ avec des milliers d'URLs mortes.
 | `07_nuclei_input.txt` | Cibles réellement envoyées à nuclei |
 | `nuclei.txt` | Findings nuclei (avec `--nuclei`) |
 | **`urls_tree.html`** | **Arbre interactif repliable des 200** (à ouvrir au navigateur) |
+| `run_config.json` | Config du run (cible, périmètre, codes, modules) — relue par `recon_mano merge` |
+| `run_stats.json` | Statut, durées et débit par module ; `wall_clock`, `sum_of_durations`, `parallel_gain` |
 
 Le fichier à lire est **`urls_all_final.txt`** (ou l'arbre `urls_tree.html`), pas
 `urls_200_final.txt` seul. Un `403` est un endpoint qui existe mais qui est
@@ -146,18 +230,20 @@ recon_mano exemple.com sortie
 Le nom de sortie est optionnel (défaut : le nom de la cible). Sans installation,
 la même chose marche via `python -m recon_mano exemple.com sortie`.
 
-Le lancement affiche une bannière, un panneau de config, puis chaque étape est un
-séparateur avec icône. Pendant qu'un outil tourne, un **compteur de lignes live +
-temps écoulé** (`🕷️ katana · 3120 lignes · 1m04s`) prouve que ça avance, et une
-estimation grossière de durée précède les étapes lourdes. À la fin : la liste des
-livrables et une **table récapitulative** (résultat + temps par étape).
+Le lancement affiche une bannière, un panneau de config, puis un **board live**
+(une ligne par module : état, lignes écrites, temps écoulé, débit accordé) prouve
+que ça avance pendant que les modules tournent en parallèle ; chaque module imprime
+son bloc de résultats (icône, nombre d'entrées, durée, diagnostics) quand il se
+termine, avec une estimation grossière de durée pour les étapes lourdes. À la fin :
+la liste des livrables et une **table récapitulative** (statut, résultat et temps
+par module, durée réelle face au cumul).
 
 Options utiles :
 
 | Flag | Effet |
 |---|---|
 | `--clean` | Supprime les anciens fichiers de sortie avant de lancer |
-| `-v`, `--verbose` | Affiche les commandes exactes et le flux des outils en direct |
+| `-v`, `--verbose` | Affiche les commandes exactes et le flux des outils en direct (sans board live) |
 | `--check` | Vérifie la présence des outils puis quitte |
 | `--all-sources` | `subfinder -all` (plus lent, plus complet) |
 | `--subdomains` | Sous-domaines déjà connus (fichier ou liste virgulée, ex: trouvés via `ffuf`) : ignore l'étape subfinder et part directement de cette liste |
@@ -172,19 +258,22 @@ Options utiles :
 | `--urlfinder-all` / `--urlfinder-curated` | Toutes les sources (défaut) vs sous-ensemble curé |
 | `--urlfinder-retries` | Réessais si urlfinder rend 0 (défaut 1) |
 | `--urlfinder-retry-wait` | Base du délai entre essais urlfinder, en s, progressif ×n (défaut 30) |
-| `--rate-limit` | Requêtes/seconde (défaut 150) |
+| `--rate-limit` | Requêtes/seconde demandées par httpx et katana (défaut 150), plafonnées par `--max-rps` |
+| `--max-rps` | Budget de débit **global** en req/s partagé par httpx, katana et nuclei (défaut 150) — voir [Exécution parallèle](#exécution-parallèle) |
+| `--workers` | Modules exécutés en parallèle au maximum (défaut 4) |
+| `--sequential` | Un module à la fois (= `--workers 1`), pour déboguer ou comparer |
 | `--revalidate` / `--no-revalidate` | Passe httpx #2 sur la carte katana → `urls_200_final.txt` (tous les 200). Défaut on |
 | `--tree` / `--no-tree` | Génère `urls_tree.html` (arbre interactif des 200). Défaut on |
 | `--in-scope` | Domaines **ajoutés à la cible** dans le périmètre (liste virgulée, ex: `devinci.fr,esilv.fr`). Sans lui, la question est posée au lancement (terminal) |
 | `--exclude` | Hôtes/domaines hors périmètre (liste virgulée) : égaux ou sous-domaines d'une entrée |
 | `--no-scope-filter` | Désactive le filtre de périmètre (comportement historique : tout est gardé) |
-| `-y`, `--yes` | Ne pose aucune question (périmètre = cible + `--in-scope`, cibles nuclei = hôtes) |
+| `-y`, `--yes` | Ne pose aucune question au lancement (périmètre = cible + `--in-scope`, cibles nuclei = hôtes) |
 | `-n`, `--nuclei` | Lance nuclei sur les hôtes/URLs **vivants** (désactivé par défaut) |
 | `--nuclei-mode` | `auto` (`-as` tech-aware, défaut) · `curated` · `full` |
-| `--nuclei-targets` | `hosts` (défaut) · `urls` — sinon demandé dans un terminal |
-| `--nuclei-severity` / `--nuclei-rate-limit` / `--nuclei-max-host-error` | Sévérités · débit · abandon hôte (défaut `medium,high,critical` / 150 / 10) |
+| `--nuclei-targets` | `hosts` (défaut) · `urls` — sinon demandé **au lancement** dans un terminal |
+| `--nuclei-severity` / `--nuclei-rate-limit` / `--nuclei-max-host-error` | Sévérités · débit demandé (plafonné par `--max-rps`) · abandon hôte (défaut `medium,high,critical` / 150 / 10) |
 | `--nuclei-timeout` / `--nuclei-concurrency` / `--nuclei-retries` | Vitesse : timeout par requête · templates parallèles · retries (défaut 5 / 25 / 1) |
-| `--skip-*` | `dnsx`, `urlfinder`, `httpx`, `katana` — chaque skip retombe sur l'étape précédente |
+| `--skip-*` | `dnsx`, `urlfinder`, `httpx`, `katana` — le module est ignoré, l'aval retombe sur l'étape précédente |
 
 Exemple complet :
 
@@ -204,6 +293,14 @@ Régénérer l'arbre HTML interactif d'un scan existant, avec la sous-commande
 ```bash
 recon_mano report sortie                      # → sortie/urls_tree.html
 recon_mano report sortie/urls_all_final.txt   # arbre tous-codes (401/403/500)
+```
+
+Rejouer la fusion finale d'un scan existant (carte, listes `*_final`, arbre) sans
+relancer aucun outil, avec la sous-commande `merge` (détails dans
+[Exécution parallèle](#recon_mano-merge--rejouer-la-fusion)) :
+
+```bash
+recon_mano merge sortie
 ```
 
 `nuclei` est désactivé par défaut : c'est la seule étape qui envoie des
