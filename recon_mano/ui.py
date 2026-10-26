@@ -80,6 +80,7 @@ STAGE_ICONS = {
     "subfinder": "🔍", "dnsx": "🧬", "urlfinder": "📜", "httpx": "📡",
     "httpx #2": "🔁", "httpx2": "🔁", "katana": "🧭", "nuclei": "💥", "report": "🌳",
     "nuclei1": "💥", "nuclei2": "💥", "merge_map": "🧩", "tree": "🌳",
+    "crtsh": "🔐", "amass": "🌐", "subdomains": "🔗", "gau": "📚", "waybackurls": "📼",
 }
 
 # statut → (glyphe, style Rich, libellé)

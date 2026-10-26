@@ -76,14 +76,54 @@ def protected_hosts(jsonl_file: Path) -> Dict[str, str]:
     return protected
 
 
-def split_httpx_output(
-    jsonl_file: Path,
+def row_keys(row: Dict[str, Any]) -> List[str]:
+    """Les clés sous lesquelles une ligne httpx « connaît » une URL : `url` et `input`."""
+    return [str(value) for value in (row.get("url"), row.get("input")) if value]
+
+
+def seen_urls(rows: Iterable[Dict[str, Any]]) -> Set[str]:
+    """Toutes les URLs (champs `url` et `input`) déjà passées par httpx."""
+    seen: Set[str] = set()
+    for row in rows:
+        seen.update(row_keys(row))
+    return seen
+
+
+def union_rows(
+    first: Iterable[Dict[str, Any]],
+    second: Iterable[Dict[str, Any]],
+    only: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Lignes httpx #1 puis #2 fusionnées, une par URL (la plus récente l'emporte).
+
+    `only` restreint les lignes de la passe #1 à celles qui concernent une URL de cet
+    ensemble (la carte) : httpx #1 a aussi testé des hôtes morts ou hors carte, qui ne
+    doivent pas apparaître dans les listes finales. Les lignes de #2 sont toutes gardées
+    (elles ne portent que ce qui a été envoyé à httpx #2). L'ordre est celui de première
+    apparition.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for row in first:
+        if only is not None and not any(key in only for key in row_keys(row)):
+            continue
+        url = row.get("url") or row.get("input")
+        if url:
+            merged[str(url)] = row
+    for row in second:
+        url = row.get("url") or row.get("input")
+        if url:
+            merged[str(url)] = row
+    return list(merged.values())
+
+
+def split_httpx_rows(
+    rows: List[Dict[str, Any]],
     all_file: Path,
     ok_file: Path,
     live_file: Optional[Path] = None,
     live_codes: Optional[Set[int]] = None,
 ) -> Tuple[int, int, int]:
-    """Éclate la sortie JSONL de httpx. Retourne (total, alive_200, live).
+    """Éclate des lignes httpx déjà lues. Retourne (total, alive_200, live).
 
     - all_file  : une ligne annotée par résultat (`url [code] [taille] [titre] [tech]`)
     - ok_file   : URLs nues en 200 uniquement
@@ -91,7 +131,6 @@ def split_httpx_output(
     """
     if live_codes is None:
         live_codes = parse_codes(DEFAULT_LIVE_CODES)
-    rows = list(iter_httpx_rows(read_lines(jsonl_file)))
 
     annotated: List[str] = []
     alive: List[str] = []
@@ -116,6 +155,18 @@ def split_httpx_output(
     live = filter_live(rows, live_codes)
     live_count = write_lines(live_file, live) if live_file is not None else len(live)
     return write_lines(all_file, annotated), write_lines(ok_file, alive), live_count
+
+
+def split_httpx_output(
+    jsonl_file: Path,
+    all_file: Path,
+    ok_file: Path,
+    live_file: Optional[Path] = None,
+    live_codes: Optional[Set[int]] = None,
+) -> Tuple[int, int, int]:
+    """Éclate la sortie JSONL de httpx (voir `split_httpx_rows`)."""
+    rows = list(iter_httpx_rows(read_lines(jsonl_file)))
+    return split_httpx_rows(rows, all_file, ok_file, live_file, live_codes)
 
 
 def clean_live_urls(urls_all_file: Path, fallback_file: Path) -> List[str]:

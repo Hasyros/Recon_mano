@@ -43,8 +43,13 @@ MIN_START_RATE = 10
 # pour la compatibilité). Sert aussi au nettoyage (--clean) et à `merge`.
 ARTIFACTS: Dict[str, str] = {
     "subfinder": "01_subfinder.txt",
+    "crtsh": "01b_crtsh.txt",
+    "amass": "01c_amass.txt",
+    "subdomains": "01_subdomains.txt",
     "dnsx": "02_dnsx.txt",
     "urlfinder": "03_urlfinder.txt",
+    "gau": "03b_gau.txt",
+    "waybackurls": "03c_waybackurls.txt",
     "httpx_input": "04_httpx_input.txt",
     "httpx_jsonl": "05_httpx.jsonl",
     "urls_all": "urls_all.txt",
@@ -52,6 +57,7 @@ ARTIFACTS: Dict[str, str] = {
     "urls_live": "urls_live.txt",
     "katana": "06_katana.txt",
     "all_urls": "all_urls.txt",
+    "httpx2_input": "08_httpx2_input.txt",
     "httpx2_jsonl": "08_httpx2.jsonl",
     "urls_all_final": "urls_all_final.txt",
     "urls_200_final": "urls_200_final.txt",

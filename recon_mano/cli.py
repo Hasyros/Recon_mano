@@ -3,16 +3,19 @@
 Pipeline : des modules indépendants, lancés par un ordonnanceur dès que leurs
 dépendances sont terminées (voir `pipeline.py` et `modules.py`)::
 
-    cible ─┬─ subfinder ── dnsx ──┐          ┌─ katana ── merge_map ── httpx #2 ─┬─ tree
-           │                      ├─ httpx ──┤                                   └─ nuclei #2 (opt-in)
-           └─ urlfinder ──────────┘          └─ nuclei #1 (opt-in, ‖ katana)
+    cible ─┬─ subfinder ─┐
+           ├─ crtsh ─────┼─ subdomains ── dnsx ──┐          ┌─ katana ──────────┐
+           ├─ amass ─────┘                       ├─ httpx ──┤                   ├─ merge_map ── httpx #2 ─┬─ tree
+           └─ urlfinder ─────────────────────────┘          └─ nuclei #1 (opt-in)│                         └─ nuclei #2 (opt-in)
+                  └─ gau ── waybackurls ───────────────────────────────────────┘
 
-subfinder et urlfinder n'ont aucune dépendance : ils tournent en parallèle.
+subfinder (-all), crtsh (Python), amass (passif) et urlfinder n'ont aucune dépendance :
+ils tournent en parallèle. Les archives sont sérialisées (urlfinder → gau → waybackurls).
 `--workers` borne les modules simultanés, `--max-rps` le débit total vers la cible
 (budget global partagé par httpx, katana et nuclei). Chaque run écrit
 `run_config.json` (périmètre, codes) et `run_stats.json` (durées par module).
-nuclei (`-n`, jamais par défaut) tourne en deux passes : par hôte pendant le crawl,
-puis par URL représentative en fin de pipeline.
+Tout est actif par défaut sauf nuclei (`-n`, jamais par défaut), qui tourne en deux
+passes : par hôte pendant le crawl, puis par URL représentative en fin de pipeline.
 
 Invocation minimale::
 
@@ -43,6 +46,7 @@ from .io_utils import count_lines
 from .liveness import DEFAULT_LIVE_CODES, parse_codes
 from .merge import merge_folder
 from .findings import severity_line
+from .config import MODULE_DEFAULTS, default_param, default_timeout_minutes, parse_module_timeouts
 from .modules import (  # noqa: F401 — ré-exportés pour compatibilité
     DEFAULT_MATCH_CODES,
     Options,
@@ -71,8 +75,18 @@ from .ui import (  # noqa: F401
 
 REQUIRED_TOOLS = ["subfinder", "dnsx", "httpx", "urlfinder", "katana"]
 
-# Anciens fichiers qu'un --clean doit aussi emporter (nuclei mono-passe, avant les deux passes).
-LEGACY_ARTIFACTS = ["07_nuclei_input.txt"]
+# Anciens fichiers qu'un --clean doit aussi emporter (nuclei mono-passe, avant les deux passes)
+# et le fichier temporaire de waybackurls (laissé par un run interrompu).
+LEGACY_ARTIFACTS = ["07_nuclei_input.txt", ".waybackurls_domains.tmp"]
+
+# Outils optionnels : (binaire, module qu'il active, ce qui se passe sans lui).
+OPTIONAL_TOOLS = [
+    ("amass", "amass", "sans lui, pas de sous-domaines amass (passif)"),
+    ("gau", "gau", "sans lui, pas d'URLs d'archives gau"),
+    ("waybackurls", "waybackurls", "sans lui, pas d'URLs waybackurls"),
+    ("nuclei", "nuclei (--nuclei)", "nécessaire seulement avec --nuclei"),
+    ("gf", "nuclei passe 2", "repli sur une liste interne de paramètres suspects"),
+]
 
 # Fichiers produits par le pipeline — sert au nettoyage (--clean).
 ARTIFACT_NAMES = list(ARTIFACTS.values()) + LEGACY_ARTIFACTS
@@ -126,18 +140,13 @@ def check_tools() -> List[str]:
             console.print(f"[red]{tool}[/red] introuvable")
             missing.append(tool)
 
-    nuclei_path = shutil.which("nuclei")
-    console.print(
-        f"[green]nuclei[/green] (optionnel) : {nuclei_path}"
-        if nuclei_path
-        else "[dim]nuclei (optionnel) introuvable — nécessaire seulement avec --nuclei[/dim]"
-    )
-    gf_path = shutil.which("gf")
-    console.print(
-        f"[green]gf[/green] (optionnel) : {gf_path}"
-        if gf_path
-        else "[dim]gf (optionnel) introuvable — repli sur une liste interne de paramètres suspects (passe 2 de nuclei)[/dim]"
-    )
+    for tool, module, fallback in OPTIONAL_TOOLS:
+        path = shutil.which(tool)
+        if path:
+            console.print(f"[green]{tool}[/green] (optionnel, module {module}) : {path}")
+        else:
+            console.print(f"[dim]{tool} (optionnel, module {module}) introuvable — {fallback}[/dim]")
+    console.print("[green]crtsh[/green] (module intégré) : aucun binaire requis (Python, crt.sh)")
     return missing
 
 
@@ -217,7 +226,62 @@ def main(
     check: bool = typer.Option(False, "--check", help="Vérifie la présence des outils puis quitte"),
     clean: bool = typer.Option(False, "--clean", help="Supprime les anciens fichiers de sortie avant de lancer"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Affiche les commandes et le flux des outils (sans board live)"),
-    all_sources: bool = typer.Option(False, "--all-sources", help="subfinder -all (plus lent)"),
+    all_sources: bool = typer.Option(
+        default_param("subfinder", "all_sources"), "--all-sources/--no-all-sources",
+        help="subfinder -all : toutes les sources (défaut, plus lent mais plus complet) ; --no-all-sources pour le mode rapide",
+    ),
+    crtsh: bool = typer.Option(
+        MODULE_DEFAULTS["crtsh"].enabled, "--crtsh/--no-crtsh",
+        help="Sous-domaines depuis crt.sh (Certificate Transparency ; module Python, sans binaire ; interroge crt.sh, pas la cible)",
+    ),
+    crtsh_timeout: int = typer.Option(
+        default_param("crtsh", "request_timeout"), "--crtsh-timeout", min=1,
+        help="crt.sh : délai par requête, en secondes (crt.sh est souvent lent)",
+    ),
+    crtsh_retries: int = typer.Option(
+        default_param("crtsh", "retries"), "--crtsh-retries", min=0,
+        help="crt.sh : nouveaux essais sur erreur / 5xx / timeout (délai croissant : 5 s, 10 s…)",
+    ),
+    amass: bool = typer.Option(
+        MODULE_DEFAULTS["amass"].enabled, "--amass/--no-amass",
+        help="Sous-domaines via amass enum PASSIF (binaire amass optionnel ; module désactivé s'il est absent)",
+    ),
+    amass_timeout: int = typer.Option(
+        default_timeout_minutes("amass"), "--amass-timeout", min=0,
+        help="amass : durée max du module, en minutes (défaut 15 ; 0 = illimité). amass passif peut durer très longtemps.",
+    ),
+    gau: bool = typer.Option(
+        MODULE_DEFAULTS["gau"].enabled, "--gau/--no-gau",
+        help="URLs d'archives via gau (binaire gau optionnel ; interroge des archives publiques, pas la cible ; lancé après urlfinder)",
+    ),
+    gau_timeout: int = typer.Option(
+        default_timeout_minutes("gau"), "--gau-timeout", min=0, help="gau : durée max du module, en minutes (défaut 15 ; 0 = illimité)",
+    ),
+    gau_threads: int = typer.Option(
+        default_param("gau", "threads"), "--gau-threads", min=1,
+        help="gau --threads (défaut 2 : prudent, les archives limitent par IP)",
+    ),
+    waybackurls: bool = typer.Option(
+        MODULE_DEFAULTS["waybackurls"].enabled, "--waybackurls/--no-waybackurls",
+        help="URLs de la Wayback Machine via waybackurls (binaire optionnel ; lancé après gau)",
+    ),
+    waybackurls_timeout: int = typer.Option(
+        default_timeout_minutes("waybackurls"), "--waybackurls-timeout", min=0,
+        help="waybackurls : durée max du module, en minutes (défaut 15 ; 0 = illimité)",
+    ),
+    archive_dedupe: bool = typer.Option(
+        default_param("merge_map", "archive_dedupe"), "--archive-dedupe/--no-archive-dedupe",
+        help="Réduit les URLs gau/waybackurls à --archive-k par signature avant httpx #2 (gau peut rendre 100k+ URLs)",
+    ),
+    archive_k: int = typer.Option(
+        default_param("merge_map", "archive_k"), "--archive-k", min=1,
+        help="URLs gardées par signature (hôte + chemin templaté + noms de paramètres) pour gau/waybackurls",
+    ),
+    module_timeout: List[str] = typer.Option(
+        [], "--module-timeout",
+        help="Timeout d'un module, en minutes : nom=minutes (répétable, 0 = illimité), ex. --module-timeout katana=30. "
+             "Prioritaire sur les options dédiées. Modules : " + ", ".join(MODULE_DEFAULTS),
+    ),
     subdomains: str = typer.Option(
         "", "--subdomains",
         help="Sous-domaines déjà connus (ex: trouvés via ffuf) : fichier (un par ligne) ou liste "
@@ -245,9 +309,9 @@ def main(
     urlfinder_all: bool = typer.Option(True, "--urlfinder-all/--urlfinder-curated", help="urlfinder -all : toutes les sources (défaut) vs sous-ensemble curé"),
     urlfinder_retries: int = typer.Option(1, "--urlfinder-retries", help="Réessais si urlfinder rend 0 (sources rate-limitées)"),
     urlfinder_retry_wait: int = typer.Option(30, "--urlfinder-retry-wait", help="Base du délai entre essais urlfinder, en s (progressif ×n)"),
-    threads: int = typer.Option(50, "--threads", help="Threads httpx"),
-    rate_limit: int = typer.Option(150, "--rate-limit", help="Requêtes/seconde demandées par httpx et katana (plafonnées par --max-rps)"),
-    concurrency: int = typer.Option(10, "--concurrency", help="Concurrence katana"),
+    threads: int = typer.Option(default_param("httpx", "threads"), "--threads", help="Threads httpx"),
+    rate_limit: int = typer.Option(MODULE_DEFAULTS["httpx"].rate, "--rate-limit", help="Requêtes/seconde demandées par httpx et katana (plafonnées par --max-rps)"),
+    concurrency: int = typer.Option(default_param("katana", "concurrency"), "--concurrency", help="Concurrence katana"),
     httpx_bin: Optional[str] = typer.Option(None, "--httpx-bin", help="Chemin du httpx ProjectDiscovery"),
     revalidate: bool = typer.Option(
         True, "--revalidate/--no-revalidate",
@@ -291,12 +355,12 @@ def main(
         help="Sévérités nuclei de la passe 1 et du run DAST de la passe 2 (le run exposition de la passe 2 n'est pas filtré)",
     ),
     nuclei_rate_limit: int = typer.Option(
-        50, "--nuclei-rate-limit",
+        MODULE_DEFAULTS["nuclei1"].rate, "--nuclei-rate-limit",
         help="nuclei passe 1 : débit demandé (req/s, plafonné par --max-rps). 50 car la passe 1 partage le budget avec katana "
              "(150 au total : nuclei 50 + katana 100).",
     ),
     nuclei2_rate_limit: int = typer.Option(
-        150, "--nuclei2-rate-limit",
+        MODULE_DEFAULTS["nuclei2"].rate, "--nuclei2-rate-limit",
         help="nuclei passe 2 : débit demandé (req/s, plafonné par --max-rps). 150 car elle tourne en fin de pipeline, presque seule.",
     ),
     nuclei_waf_factor: float = typer.Option(
@@ -317,6 +381,7 @@ def main(
     nuclei_timeout: int = typer.Option(5, "--nuclei-timeout", help="nuclei -timeout (s) : ne pas s'attarder sur un hôte lent"),
     nuclei_concurrency: int = typer.Option(25, "--nuclei-concurrency", help="nuclei -c : templates en parallèle"),
     nuclei_retries: int = typer.Option(1, "--nuclei-retries", help="nuclei -retries"),
+    skip_subfinder: bool = typer.Option(False, "--skip-subfinder"),
     skip_dnsx: bool = typer.Option(False, "--skip-dnsx"),
     skip_urlfinder: bool = typer.Option(False, "--skip-urlfinder"),
     skip_httpx: bool = typer.Option(False, "--skip-httpx"),
@@ -328,7 +393,7 @@ def main(
     workers: int = typer.Option(4, "--workers", min=1, help="Nombre maximum de modules exécutés en parallèle"),
     sequential: bool = typer.Option(False, "--sequential", help="Un module à la fois (= --workers 1) : débogage / comparaison"),
 ):
-    """Recon Mano — subfinder ‖ urlfinder → dnsx → httpx → katana ‖ nuclei #1 → httpx #2 → nuclei #2 (opt-in).
+    """Recon Mano — (subfinder ‖ crtsh ‖ amass) → dnsx → httpx → katana ‖ nuclei #1 → httpx #2 → nuclei #2 (opt-in) ; urlfinder → gau → waybackurls en parallèle.
 
     Exemple : recon_mano exemple.com sortie -n
     """
@@ -368,6 +433,16 @@ def main(
         raise typer.Exit(code=2)
     try:
         passes = resolve_nuclei_passes(nuclei_passes, nuclei_targets)
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=2)
+
+    try:
+        timeouts = {
+            "amass": amass_timeout * 60 or None, "gau": gau_timeout * 60 or None,
+            "waybackurls": waybackurls_timeout * 60 or None,
+        }
+        timeouts.update(parse_module_timeouts(module_timeout))
     except ValueError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=2)
@@ -417,13 +492,21 @@ def main(
         nuclei_k=nuclei_k, nuclei_priority=nuclei_priority,
         nuclei_max_host_error=nuclei_max_host_error, nuclei_timeout=nuclei_timeout,
         nuclei_concurrency=nuclei_concurrency, nuclei_retries=nuclei_retries,
-        skip_dnsx=skip_dnsx, skip_urlfinder=skip_urlfinder, skip_httpx=skip_httpx, skip_katana=skip_katana,
+        crtsh=crtsh, crtsh_timeout=crtsh_timeout, crtsh_retries=crtsh_retries,
+        amass=amass, gau=gau, gau_threads=gau_threads, waybackurls=waybackurls,
+        archive_dedupe=archive_dedupe, archive_k=archive_k, timeouts=timeouts,
+        skip_subfinder=skip_subfinder, skip_dnsx=skip_dnsx, skip_urlfinder=skip_urlfinder,
+        skip_httpx=skip_httpx, skip_katana=skip_katana,
     )
 
     scan_bits = []
     if nuclei:
         scan_bits.append(f"nuclei {nuclei_mode} · passe{'s' if ',' in passes else ''} {passes}")
     scan_bits.append(f"revalidate {'on' if revalidate else 'off'}")
+    sources = [name for name, on in (("subfinder" + (" -all" if all_sources else ""), not skip_subfinder), ("crtsh", crtsh), ("amass", amass)) if on]
+    archives = [name for name, on in (("urlfinder", not skip_urlfinder), ("gau", gau), ("waybackurls", waybackurls)) if on]
+    scan_bits.append(f"sous-domaines {'+'.join(sources) or 'aucune source'}")
+    scan_bits.append(f"archives {'+'.join(archives) or 'aucune'}")
     if scope_enabled:
         scan_bits.append(f"scope {','.join(scope_apexes)}")
         if scope_excludes:
@@ -461,6 +544,8 @@ def main(
         "live_codes": sorted(live_code_set),
         "match_codes": match_codes,
         "modules": [m.name for m in modules if m.enabled],
+        "archive": {"dedupe": archive_dedupe, "k": archive_k},
+        "timeouts": {name: seconds for name, seconds in sorted(timeouts.items())},
         "nuclei": {
             "enabled": nuclei, "passes": passes if nuclei else "", "mode": nuclei_mode, "k": nuclei_k,
             "waf_factor": nuclei_waf_factor, "priority": nuclei_priority,

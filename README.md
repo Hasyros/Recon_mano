@@ -1,8 +1,10 @@
 # Recon Mano
 
 Pipeline Python de découverte et reconnaissance de sous-domaines, orchestrant
-`subfinder`, `dnsx`, `urlfinder`, `httpx`, `katana` et (en option) `nuclei`
-en deux passes.
+`subfinder`, `crt.sh` (module Python), `amass` (passif), `dnsx`, `urlfinder`, `gau`,
+`waybackurls`, `httpx`, `katana` et (en option, jamais par défaut) `nuclei` en deux
+passes. **Tout est actif par défaut** (mode « full ») et chaque module se coupe
+individuellement ; seul nuclei est opt-in (`-n`).
 
 > À n'utiliser que sur des cibles pour lesquelles tu disposes d'une autorisation
 > explicite : programme de bug bounty dans son périmètre, mission de pentest, ou
@@ -11,13 +13,15 @@ en deux passes.
 ## Workflow
 
 ```
-cible ─┬─ subfinder → dnsx (-wd) ── hôtes ──┐
-       │                                     ├─ merge → httpx ─┬─ urls_all.txt
-       └─ urlfinder (-d apex) ──── URLs ────┘                  └─ urls_200.txt → katana
-                                                                                   │
-                                               all_urls → httpx #2 (revalidation) ─┘
+cible ─┬─ subfinder (-all) ─┐
+       ├─ crt.sh ───────────┼─ subdomains → dnsx (-wd) ── hôtes ──┐
+       ├─ amass (passif) ───┘                                       ├─ merge → httpx ─┬─ urls_all.txt
+       └─ urlfinder (-d apex) ───────────── URLs ──────────────────┘                 └─ urls_200.txt → katana
+              └─ gau → waybackurls  (archives sérialisées)                                       │
+                              │                                                                   │
+                              └──────── carte = seeds + crawl + archives réduites ───────────────┘
                                                      │
-                                     urls_200_final.txt · urls_tree.html
+                       httpx #2 (URLs inédites seulement) → urls_200_final.txt · urls_tree.html
                                                      │
                                                [--nuclei] (opt-in)
                               (passe 1 par hôte ‖ katana · passe 2 par URL en fin de run)
@@ -26,10 +30,13 @@ cible ─┬─ subfinder → dnsx (-wd) ── hôtes ──┐
 Les étapes s'exécutent en parallèle quand leurs dépendances le permettent (voir
 [Exécution parallèle](#exécution-parallèle)).
 
-**httpx #2** est essentiel : katana découvre des URLs par crawl mais ne connaît
-pas leur code HTTP. La revalidation donne les statuts réels et **`urls_200_final.txt`**
-= tous les 200 (archives *et* découvertes katana). L'arbre `urls_tree.html` est
-généré depuis cette liste.
+**httpx #2** est essentiel : katana découvre des URLs par crawl et gau/waybackurls
+rendent des URLs d'archive, mais personne ne connaît leur code HTTP. La revalidation
+donne les statuts réels et **`urls_200_final.txt`** = tous les 200 (archives *et*
+découvertes katana). L'arbre `urls_tree.html` est généré depuis cette liste.
+**httpx #2 ne teste que les URLs de la carte absentes de `05_httpx.jsonl`** : les
+seeds qu'httpx #1 a déjà validées ne sont pas re-testées, leurs lignes sont reprises
+telles quelles (voir [httpx #2 sur les seules URLs inédites](#httpx-2-sur-les-seules-urls-inédites)).
 
 Trois choix de conception qui expliquent la forme du graphe :
 
@@ -60,23 +67,38 @@ ignorées ou désactivées — c'est le module qui gère ses entrées manquantes
 replis). Deux modules sans lien de dépendance tournent en même temps :
 
 ```
-subfinder ── dnsx ──┐          ┌─ katana ── merge_map ── httpx #2 ─┬─ tree
-                    ├─ httpx ──┤                                   └─ nuclei #2 (opt-in)
-urlfinder ──────────┘          └─ nuclei #1 (opt-in, ‖ katana)
+subfinder ─┐
+crtsh ─────┼─ subdomains ── dnsx ──┐          ┌─ katana ────────┐
+amass ─────┘                       ├─ httpx ──┤                 ├─ merge_map ── httpx #2 ─┬─ tree
+urlfinder ─────────────────────────┘          └─ nuclei #1      │                         └─ nuclei #2
+   └─ gau ── waybackurls ───────────────────────  (opt-in, ‖ katana) ──┘                      (opt-in)
 ```
 
-| Module | Dépend de | Rôle |
-|---|---|---|
-| `subfinder` | — | Sous-domaines (ou liste `--subdomains`) |
-| `dnsx` | subfinder | Résolution DNS, wildcards filtrés |
-| `urlfinder` | — | Archives, depuis l'apex seul : tourne **en parallèle** de subfinder + dnsx |
-| `httpx` | dnsx, urlfinder | Fusion des hôtes et des URLs d'archive, une passe |
-| `nuclei1` | httpx | Opt-in (`-n`) : nuclei **par hôte**, pendant le crawl katana (voir [nuclei en deux passes](#nuclei-en-deux-passes)) |
-| `katana` | httpx | Crawl des seeds vivantes |
-| `merge_map` | katana | `all_urls.txt` = seeds vivantes + crawl, périmètre strict (léger, sans réseau) |
-| `httpx2` | merge_map | Revalidation de la carte |
-| `tree` | httpx2 | `urls_tree.html` |
-| `nuclei2` | httpx2 | Opt-in (`-n`) : nuclei **par URL représentative** (DAST + exposition), fin de pipeline |
+| Module | Dépend de | Binaire | Option | Timeout / débit par défaut | Rôle |
+|---|---|---|---|---|---|
+| `subfinder` | — | subfinder | `--skip-subfinder`, `--no-all-sources` | illimité | Sous-domaines, **`-all` par défaut** (ou liste `--subdomains`) |
+| `crtsh` | — | **aucun** (Python, `urllib`) | `--no-crtsh` | 10 min de module · 60 s/requête · 2 nouveaux essais | Sous-domaines des certificats (crt.sh), un appel par apex du périmètre |
+| `amass` | — | amass (optionnel) | `--no-amass`, `--amass-timeout` | **15 min** | `amass enum` **passif** |
+| `subdomains` | subfinder, crtsh, amass | — | — | — | Fusion + dédoublonnage + périmètre → `01_subdomains.txt` |
+| `dnsx` | subdomains | dnsx | `--skip-dnsx` | illimité | Résolution DNS, wildcards filtrés |
+| `urlfinder` | — | urlfinder | `--skip-urlfinder` | illimité | Archives, depuis l'apex seul : tourne **en parallèle** des sous-domaines |
+| `gau` | urlfinder | gau (optionnel) | `--no-gau`, `--gau-timeout`, `--gau-threads` | **15 min** · 2 threads | URLs d'archives (Wayback, CommonCrawl, OTX, urlscan) |
+| `waybackurls` | gau | waybackurls (optionnel) | `--no-waybackurls`, `--waybackurls-timeout` | **15 min** | URLs de la Wayback Machine |
+| `httpx` | dnsx, urlfinder | httpx | `--skip-httpx` | 150 req/s | Fusion des hôtes et des URLs urlfinder, une passe |
+| `nuclei1` | httpx | nuclei | `-n` | 50 req/s | Opt-in : nuclei **par hôte**, pendant le crawl katana (voir [nuclei en deux passes](#nuclei-en-deux-passes)) |
+| `katana` | httpx | katana | `--skip-katana` | 150 req/s | Crawl des seeds vivantes |
+| `merge_map` | katana, gau, waybackurls | — | `--no-archive-dedupe`, `--archive-k` | — | `all_urls.txt` = seeds vivantes + crawl + archives réduites, périmètre strict (léger, sans réseau) |
+| `httpx2` | merge_map | httpx | `--no-revalidate` | 150 req/s | Validation des URLs de la carte **absentes d'httpx #1** |
+| `tree` | httpx2 | — | `--no-tree` | — | `urls_tree.html` |
+| `nuclei2` | httpx2 | nuclei | `-n` | 150 req/s | Opt-in : nuclei **par URL représentative** (DAST + exposition), fin de pipeline |
+
+Les valeurs par défaut (module actif ou non, débit, timeout, paramètres) vivent dans
+une seule table, `recon_mano/config.py` (`MODULE_DEFAULTS`) ; les options de la CLI les
+surchargent. `--module-timeout nom=minutes` (répétable, `0` = illimité) fixe le
+timeout de **n'importe quel** module, par ex. `--module-timeout katana=30`, et l'emporte
+sur les options dédiées (`--amass-timeout`…). `PRESETS` contient pour l'instant le seul
+preset `full` (tous les modules) ; les presets rapides viendront plus tard, il n'y a pas
+encore d'option `--mode`.
 
 - **`--workers N`** (défaut 4) : nombre maximum de modules simultanés.
   **`--sequential`** = `--workers 1` (un seul module à la fois, ordre historique) —
@@ -84,21 +106,25 @@ urlfinder ──────────┘          └─ nuclei #1 (opt-in, �
 - **`--max-rps N`** (défaut 150) : budget de débit **global**. `--rate-limit`,
   `--nuclei-rate-limit` et `--nuclei2-rate-limit` ne sont plus que des débits
   *demandés* ; la somme des débits accordés aux modules qui frappent la cible
-  (httpx, katana, nuclei #1, nuclei #2) ne dépasse
+  (httpx, katana, httpx #2, nuclei #1, nuclei #2) ne dépasse
   jamais `--max-rps`. Le budget est global parce que c'est la cible qui encaisse
   le trafic cumulé, pas chaque outil : deux modules à 150 req/s en parallèle font
   300 req/s côté serveur, ce qui déclenche WAF et bans. Un module reçoit
   `min(demandé, budget restant)` au démarrage ; s'il reste moins de
   `min(demandé, 10)`, il attend qu'un autre module libère du budget. Les modules
-  qui n'attaquent pas la cible (subfinder, dnsx, urlfinder, merge_map, tree) n'en
-  consomment pas. Pour dépasser 150 req/s, relever `--max-rps` en même temps que
+  qui n'attaquent pas la cible (subfinder, crtsh, amass, subdomains, dnsx, urlfinder, gau,
+  waybackurls, merge_map, tree) n'en consomment pas : crt.sh et les archives sont des
+  services publics, pas la cible. Pour dépasser 150 req/s, relever `--max-rps` en même temps que
   `--rate-limit`.
 - **Binaire manquant** : le module est `désactivé` (« binaire X introuvable »), le
   reste du pipeline continue avec ses replis (ex. sans dnsx, httpx part de la
-  liste subfinder). **Exception dans un module** : `échec`, message dans le
-  récapitulatif (traceback complet avec `-v`), les modules indépendants finissent.
-  Si subfinder ne rend aucun hôte en périmètre, il est en échec et tout l'aval
-  est ignoré proprement (code retour 1).
+  liste `01_subdomains.txt`). amass, gau et waybackurls sont **optionnels** : sans eux
+  les autres sources font le travail. **Exception dans un module** : `échec`, message
+  dans le récapitulatif (traceback complet avec `-v`), les modules indépendants finissent
+  (crt.sh injoignable ne bloque rien).
+  Si **aucune** source (subfinder, crtsh, amass, `--subdomains`) ne rend d'hôte en
+  périmètre, `subdomains` est en échec et tout l'aval est ignoré proprement (code
+  retour 1) ; un subfinder vide seul n'est plus fatal.
 - **katana ne crawle que du confirmé vivant** : si httpx n'a trouvé aucune URL
   vivante, katana est *ignoré* (jamais de crawl de cibles non confirmées). Le repli
   sur les entrées brutes fusionnées n'existe que pour `--skip-httpx`.
@@ -125,11 +151,15 @@ recon_mano merge sortie
 ```
 
 Reconstruit, **sans lancer aucun outil**, la fin de la chaîne à partir des
-fichiers déjà présents : `all_urls.txt` (seeds `urls_live.txt` + `06_katana.txt`,
-périmètre strict), `urls_all_final.txt` / `urls_200_final.txt` /
-`urls_live_final.txt` (depuis `08_httpx2.jsonl`, sinon `05_httpx.jsonl`) et
-`urls_tree.html`. Le périmètre et les codes vivants viennent de `run_config.json`
-(à défaut : périmètre déduit du nom du dossier, codes par défaut). Utile après
+fichiers déjà présents : `all_urls.txt` (seeds `urls_live.txt` + `06_katana.txt` +
+archives `03b_gau.txt` / `03c_waybackurls.txt` réduites, périmètre strict),
+`urls_all_final.txt` / `urls_200_final.txt` / `urls_live_final.txt` (**union** des lignes
+d'`05_httpx.jsonl` pour les URLs de la carte et de `08_httpx2.jsonl` ; `05_httpx.jsonl`
+seul si `08_httpx2.jsonl` est absent) et `urls_tree.html`. Le périmètre, les codes
+vivants et la réduction des archives (`archive.dedupe`, `archive.k`) viennent de
+`run_config.json` (à défaut : périmètre déduit du nom du dossier, codes par défaut,
+réduction K=3). Une URL d'archive que httpx n'a jamais testée ne peut pas entrer dans les
+listes finales : le rejeu ne valide rien, il ne fait que recombiner. Utile après
 avoir ajouté une exclusion à `run_config.json`, édité une liste à la main ou
 relancé un seul module. Les rejets du rejeu sont ajoutés à `rejected_scope.tsv`
 sous l'étape `merge`.
@@ -138,19 +168,24 @@ sous l'étape `merge`.
 
 | Fichier | Contenu |
 |---|---|
-| `01_subfinder.txt` | Sous-domaines théoriques (bruts) |
+| `01_subfinder.txt` | Sortie de subfinder (ou liste `--subdomains`), filtrée au périmètre |
+| `01b_crtsh.txt` | Sous-domaines vus dans les certificats (crt.sh), filtrés au périmètre |
+| `01c_amass.txt` | Sous-domaines d'amass passif, filtrés au périmètre |
+| `01_subdomains.txt` | **Fusion dédoublonnée des trois sources**, périmètre appliqué — entrée de dnsx |
 | `02_dnsx.txt` | Sous-domaines résolvant, wildcards filtrés |
-| `03_urlfinder.txt` | Chemins historiques issus des archives |
+| `03_urlfinder.txt` | Chemins historiques issus des archives (urlfinder) |
+| `03b_gau.txt` / `03c_waybackurls.txt` | URLs d'archives de gau / waybackurls (http(s) seulement, périmètre appliqué) — **non validées** : elles ne passent que par `merge_map` puis httpx #2 |
 | `04_httpx_input.txt` | Fusion des deux branches (entrée httpx) |
 | `05_httpx.jsonl` | Sortie httpx brute |
 | `urls_all.txt` / `urls_200.txt` | Surface vivante annotée / 200 — **avant** crawl |
 | `urls_live.txt` | URLs nues dont le code est dans `--live-codes` — **seeds de katana** |
 | `06_katana.txt` | Crawl actif (URLs découvertes, sans code HTTP) |
-| `all_urls.txt` | Carte brute (seeds + crawl, non revalidée) |
-| `08_httpx2.jsonl` | httpx #2 brut (revalidation de la carte) |
-| **`urls_all_final.txt`** | **Triage manuel** — surface vivante complète, annotée (archives + katana) |
-| **`urls_200_final.txt`** | **Tous les endpoints 200** (archives + katana) |
-| `urls_live_final.txt` | Liste live après httpx #2 — **source de la passe 2 de nuclei** (la passe 1 part de `urls_live.txt`) |
+| `all_urls.txt` | Carte (seeds + crawl + archives réduites, périmètre strict) |
+| `08_httpx2_input.txt` | Ce qui a réellement été envoyé à httpx #2 : URLs de la carte absentes d'`05_httpx.jsonl` |
+| `08_httpx2.jsonl` | httpx #2 brut — **uniquement les nouvelles lignes** (les seeds d'httpx #1 ne sont pas re-testées) |
+| **`urls_all_final.txt`** | **Triage manuel** — surface vivante complète, annotée (seeds + katana + gau + waybackurls), union des lignes httpx #1 et #2 |
+| **`urls_200_final.txt`** | **Tous les endpoints 200** (toutes sources, validés) |
+| `urls_live_final.txt` | Liste live après httpx #2 (404, 5xx et timeouts écartés) — **source de la passe 2 de nuclei** (la passe 1 part de `urls_live.txt`) |
 | `rejected_scope.tsv` | Entrées écartées par le filtre de périmètre (`étape<TAB>hôte<TAB>ligne`), remis à zéro à chaque run |
 | `07_nuclei1_input.txt` | Passe 1 : hôtes (`scheme://hôte[:port]`) envoyés à nuclei (+ `07_nuclei1_input_normal.txt` / `_waf.txt` si des hôtes sont derrière un WAF/CDN) |
 | `07_nuclei2_input.txt` | Passe 2 : URLs représentantes (K par signature, statiques exclues) |
@@ -187,6 +222,9 @@ go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install -v github.com/owasp-amass/amass/v5/cmd/amass@main          # optionnel (module amass)
+go install github.com/lc/gau/v2/cmd/gau@latest                        # optionnel (module gau)
+go install github.com/tomnomnom/waybackurls@latest                    # optionnel (module waybackurls)
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest   # optionnel
 go install github.com/tomnomnom/gf@latest                              # optionnel (passe 2 de nuclei)
 ```
@@ -254,9 +292,17 @@ Options utiles :
 |---|---|
 | `--clean` | Supprime les anciens fichiers de sortie avant de lancer |
 | `-v`, `--verbose` | Affiche les commandes exactes et le flux des outils en direct (sans board live) |
-| `--check` | Vérifie la présence des outils puis quitte |
-| `--all-sources` | `subfinder -all` (plus lent, plus complet) |
-| `--subdomains` | Sous-domaines déjà connus (fichier ou liste virgulée, ex: trouvés via `ffuf`) : ignore l'étape subfinder et part directement de cette liste |
+| `--check` | Vérifie la présence des outils puis quitte (requis : subfinder, dnsx, httpx, urlfinder, katana ; optionnels : amass, gau, waybackurls, nuclei, gf — crt.sh n'a besoin d'aucun binaire) |
+| `--all-sources` / `--no-all-sources` | `subfinder -all` : **défaut on** (toutes les sources, plus lent mais plus complet) ; `--no-all-sources` pour le mode rapide |
+| `--subdomains` | Sous-domaines déjà connus (fichier ou liste virgulée, ex: trouvés via `ffuf`) : **remplace subfinder** ; crt.sh et amass s'y ajoutent sauf `--no-crtsh` / `--no-amass` (voir [Sources de sous-domaines](#sources-de-sous-domaines)) |
+| `--crtsh` / `--no-crtsh` | Sous-domaines depuis crt.sh (défaut on, sans binaire) |
+| `--crtsh-timeout` / `--crtsh-retries` | crt.sh : délai par requête en secondes (défaut 60) · nouveaux essais sur erreur/5xx/timeout (défaut 2, délai 5 s puis 10 s) |
+| `--amass` / `--no-amass` | `amass enum` passif (défaut on ; module désactivé si le binaire manque) |
+| `--amass-timeout` | Durée max du module amass, en minutes (défaut **15** ; `0` = illimité) |
+| `--gau` / `--no-gau`, `--gau-timeout`, `--gau-threads` | URLs d'archives via gau (défaut on) · durée max en minutes (défaut **15**) · `--threads` (défaut 2) |
+| `--waybackurls` / `--no-waybackurls`, `--waybackurls-timeout` | URLs de la Wayback Machine (défaut on) · durée max en minutes (défaut **15**) |
+| `--archive-dedupe` / `--no-archive-dedupe`, `--archive-k` | Réduit les URLs gau/waybackurls à K par signature avant httpx #2 (défaut on, K=3) — voir [Archives](#archives-urlfinder--gau--waybackurls) |
+| `--module-timeout nom=minutes` | Timeout d'un module quelconque (répétable, `0` = illimité) ; prioritaire sur les options dédiées |
 | `--no-wildcard-filter` | Désactive `dnsx -wd` |
 | `--match-codes` | Codes retenus par httpx (défaut : large, 401/403/500 compris) — pilote les fichiers de triage |
 | `--live-codes` | Codes jugés « vivants » (défaut `200,301,302,307,308,401,403`) : seules ces URLs alimentent katana et nuclei, jamais les 404/5xx |
@@ -272,7 +318,7 @@ Options utiles :
 | `--max-rps` | Budget de débit **global** en req/s partagé par httpx, katana et nuclei #1/#2 (défaut 150) — voir [Exécution parallèle](#exécution-parallèle) |
 | `--workers` | Modules exécutés en parallèle au maximum (défaut 4) |
 | `--sequential` | Un module à la fois (= `--workers 1`), pour déboguer ou comparer |
-| `--revalidate` / `--no-revalidate` | Passe httpx #2 sur la carte katana → `urls_200_final.txt` (tous les 200). Défaut on |
+| `--revalidate` / `--no-revalidate` | Passe httpx #2 sur les URLs inédites de la carte (katana, gau, waybackurls) → `urls_200_final.txt` (tous les 200). Défaut on |
 | `--tree` / `--no-tree` | Génère `urls_tree.html` (arbre interactif des 200). Défaut on |
 | `--in-scope` | Domaines **ajoutés à la cible** dans le périmètre (liste virgulée, ex: `devinci.fr,esilv.fr`). Sans lui, la question est posée au lancement (terminal) |
 | `--exclude` | Hôtes/domaines hors périmètre (liste virgulée) : égaux ou sous-domaines d'une entrée |
@@ -290,7 +336,7 @@ Options utiles :
 | `--nuclei-priority` / `--no-nuclei-priority` | Passe 2 : run exposition/misconfig sur les chemins sensibles (défaut on) |
 | `--nuclei-max-host-error` | nuclei `-mhe` : abandon d'un hôte après N erreurs, les deux passes (défaut 10) |
 | `--nuclei-timeout` / `--nuclei-concurrency` / `--nuclei-retries` | Vitesse : timeout par requête · templates parallèles · retries, les deux passes (défaut 5 / 25 / 1) |
-| `--skip-*` | `dnsx`, `urlfinder`, `httpx`, `katana` — le module est ignoré, l'aval retombe sur l'étape précédente |
+| `--skip-*` | `subfinder`, `dnsx`, `urlfinder`, `httpx`, `katana` — le module est ignoré, l'aval retombe sur l'étape précédente (`--skip-subfinder` ne perd pas une liste `--subdomains`) |
 
 Exemple complet :
 
@@ -396,6 +442,89 @@ vue lisible fusionnée (`[sévérité] template-id URL`, du plus grave au moins 
 dédoublonnée) et une ligne de synthèse donne le décompte par sévérité. Seules les
 passes terminées dans **ce** run alimentent `nuclei.txt` : un JSONL périmé d'un
 run précédent est ignoré.
+
+### Sources de sous-domaines
+
+Trois sources sans dépendance tournent **en parallèle**, puis `subdomains` les fusionne
+(`01_subdomains.txt`, lu par dnsx). Chacune est filtrée au périmètre (étapes `subfinder`,
+`crtsh`, `amass`, puis `subdomains` dans `rejected_scope.tsv`). Seules les sources qui ont
+produit leur fichier dans **ce** run comptent : un `01b_crtsh.txt` périmé est ignoré.
+
+- **subfinder** : `-all` par défaut ; un `-d` par apex du périmètre (cible + `--in-scope`).
+  Un résultat vide n'est plus fatal à lui seul.
+- **crt.sh** (`crtsh`) : module Python pur (`urllib.request`, aucune dépendance). Une requête
+  `https://crt.sh/?q=%25.<apex>&output=json` par apex du périmètre ; `name_value` est
+  découpé sur les retours à la ligne, les `*.` sont retirés, les noms sont mis en minuscules,
+  les adresses e-mail, IP et noms invalides écartés. crt.sh est souvent lent : 60 s par
+  requête (`--crtsh-timeout`), jusqu'à 2 nouveaux essais avec délai croissant (5 s puis 10 s)
+  sur erreur réseau, timeout, 5xx/429 ou JSON tronqué (`--crtsh-retries`). Un apex en échec
+  n'empêche pas les autres ; tous en échec = module en échec, le pipeline continue.
+- **amass** : `amass enum` **passif** uniquement (jamais `-active`, donc aucun trafic vers la
+  cible), durée max 15 min (`--amass-timeout`) car le passif peut durer très longtemps. À la
+  fin, les noms trouvés avant l'échéance sont quand même relus. Invocation en deux temps,
+  identique en v4 et v5 : `amass enum -passive -d a,b -timeout N -nocolor` puis
+  `amass subs -names -d a,b -nocolor` dont la sortie standard est capturée. Raison : en v5,
+  `enum` n'a plus de `-o` (les résultats vont sur la sortie standard), `-passive` est
+  « déprécié car passif par défaut » (toujours accepté) et `-timeout` y est un délai *sans
+  progrès* (en v4, la durée totale) — le vrai plafond est donc l'échéance du module.
+  `-silent` n'est jamais passé (il coupe la sortie). amass garde une base locale
+  (`~/.config/amass`) : les noms déjà connus des runs précédents pour ces domaines
+  ressortent aussi, ils restent filtrés par le périmètre. En v5 `enum` démarre un moteur
+  `amass engine` en arrière-plan, comme le prévoit l'outil.
+- **`--subdomains <liste>`** : la liste **remplace subfinder** (comme avant), mais crt.sh et
+  amass s'y **ajoutent** tant que `--no-crtsh` / `--no-amass` ne sont pas passés : ces
+  sources passives sont inoffensives pour une liste venue de ffuf. Pour ne partir que de la
+  liste : `--subdomains liste.txt --no-crtsh --no-amass`.
+
+Si **aucune** source ne rend d'hôte en périmètre, `subdomains` échoue (« Aucun sous-domaine
+… arrêt ») et tout l'aval est ignoré.
+
+**Compromis de vitesse.** `subdomains` attend ses trois sources : amass (jusqu'à 15 min)
+retarde donc dnsx et httpx. Avec `--no-amass`, ou `--amass-timeout 5`, le pipeline reprend
+sa vitesse d'avant.
+
+### Archives (urlfinder → gau → waybackurls)
+
+urlfinder, gau et waybackurls interrogent les **mêmes** archives publiques (Wayback Machine,
+CommonCrawl…), déjà rate-limitées par IP. Pour ne pas les marteler ensemble, les trois sont
+**sérialisées** : `gau` démarre quand urlfinder est terminé, `waybackurls` quand gau l'est
+(`--no-gau` ne bloque pas waybackurls : il attend simplement urlfinder). Toute la chaîne tourne
+en parallèle de dnsx, httpx et katana, et n'envoie aucune requête à la cible (`network=False`,
+hors du budget `--max-rps`). gau et waybackurls utilisent tous les apex du périmètre
+(urlfinder, lui, reste sur l'apex de la cible) ; leurs sorties sont des fichiers à part
+(`03b_gau.txt`, `03c_waybackurls.txt`), http(s) seulement, filtrés au périmètre. gau prend
+les domaines en arguments, `--subs --threads 2 --timeout 45 --blacklist <extensions
+statiques courantes>`, et sa sortie standard est capturée (son `--o` *ajoute* à un fichier
+existant) ; waybackurls lit les domaines sur l'entrée standard (avec un argument il n'en
+traiterait qu'un), sous-domaines inclus.
+
+**Ces URLs ne sont jamais testées avant `merge_map`** et n'alimentent ni katana (seeds =
+`urls_live.txt`) ni nuclei #1 (hôtes d'`urls_live.txt`) en direct. `merge_map` (qui attend
+katana **et** la chaîne d'archives) les ajoute à la carte après : périmètre → exclusion des
+ressources statiques (`signatures.is_static`) → réduction à `--archive-k` (défaut 3) URLs par
+signature (`signatures.representatives` : hôte + chemin templaté + noms de paramètres), car
+gau peut rendre 100k+ URLs (`--no-archive-dedupe` pour tout garder, statiques toujours
+exclues). httpx #2 les valide ensuite : 404, 5xx et timeouts n'entrent dans aucune liste live.
+Si httpx #2 ne tourne pas (`--skip-httpx`, `--no-revalidate`, binaire absent), ces URLs
+restent dans `all_urls.txt` mais nuclei #2 ne les reçoit pas.
+
+**Compromis.** `merge_map`, donc httpx #2, attend maintenant la fin des archives en plus de
+katana. Dans un run typique (urlfinder ≈ quelques minutes, gau et waybackurls démarrés pendant
+dnsx/httpx, katana ensuite long), la chaîne finit avant katana et ne coûte rien. Si les archives
+sont plus lentes que katana, httpx #2 attend la fin de la chaîne — au pire la durée de
+l'écart, borné par les timeouts de module (15 min chacun). Pour ne pas attendre :
+`--no-gau --no-waybackurls`, ou `--gau-timeout` / `--waybackurls-timeout` plus bas.
+
+### httpx #2 sur les seules URLs inédites
+
+httpx #2 ne reteste pas ce qu'httpx #1 a déjà validé. Il lit `05_httpx.jsonl` (champs `url` et
+`input`), écrit dans `08_httpx2_input.txt` les URLs de la carte qui n'y figurent pas et ne
+lance httpx que sur celles-là (rien du tout s'il n'y en a pas). `08_httpx2.jsonl` ne contient
+donc que les **nouvelles** lignes. Les listes `urls_*_final.txt` sont ensuite construites sur
+l'union des lignes d'httpx #1 (pour les URLs de la carte) et d'httpx #2 : mêmes lignes
+qu'avant (un test le prouve avec un faux httpx), pour beaucoup moins de requêtes. Un
+`05_httpx.jsonl` d'un run précédent n'est jamais pris en compte. Limite : une URL qu'httpx #1 a
+testée mais écartée par `--match-codes` (absente du JSONL) est retestée par httpx #2.
 
 ### urlfinder qui rend 0
 

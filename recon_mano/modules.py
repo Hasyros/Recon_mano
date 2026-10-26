@@ -2,9 +2,17 @@
 
 DAG (une flèche = « doit être terminé avant »)::
 
-    subfinder ── dnsx ──┐             ┌─ katana ─ merge_map ─ httpx2 ─┬─ tree
-                        ├─ httpx ─────┤                               └─ nuclei2 (opt-in)
-    urlfinder ──────────┘             └─ nuclei1 (opt-in, ‖ katana)
+    subfinder ─┐
+    crtsh ─────┼─ subdomains ─ dnsx ─┐             ┌─ katana ─────────┐
+    amass ─────┘                      ├─ httpx ─────┤                  ├─ merge_map ─ httpx2 ─┬─ tree
+    urlfinder ────────────────────────┘             └─ nuclei1 (opt-in)│                     └─ nuclei2 (opt-in)
+       └─ gau ─ waybackurls ────────────────────────────────────────────┘
+
+Sous-domaines : subfinder (-all), crtsh (Python, crt.sh) et amass (passif) tournent en
+parallèle puis `subdomains` les fusionne (`01_subdomains.txt`, lu par dnsx). Archives :
+urlfinder → gau → waybackurls sont **sérialisés** (mêmes archives Wayback/CommonCrawl,
+déjà rate-limitées) mais tournent en parallèle du reste ; leurs URLs ne sont validées
+par aucun httpx avant `merge_map`, qui les réduit puis les confie à httpx #2.
 
 nuclei1 (par hôte) démarre dès qu'httpx #1 a confirmé les hôtes vivants et tourne
 pendant le crawl katana ; nuclei2 (par URL représentative) clôt le pipeline.
@@ -17,19 +25,31 @@ variables locales, et journalise via `ctx.log` (imprimé d'un bloc en fin de mod
 
 from __future__ import annotations
 
+import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
+from . import crtsh as crtsh_client
 from . import findings, runner, signatures
+from .config import MODULE_DEFAULTS, default_param
 from .io_utils import count_lines, read_lines, write_lines
-from .liveness import DEFAULT_LIVE_CODES, clean_live_urls, protected_hosts, split_httpx_output
+from .liveness import (
+    DEFAULT_LIVE_CODES,
+    clean_live_urls,
+    iter_httpx_rows,
+    protected_hosts,
+    seen_urls,
+    split_httpx_output,
+    split_httpx_rows,
+    union_rows,
+)
 from .pipeline import Context, Module, ModuleError, ModuleResult, ModuleSkipped, Status
 from .report import write_report as write_tree_report
-from .scope import ScopeFilter
+from .scope import ScopeFilter, host_of
 from .ui import STAGE_ICONS, console, eta_line, human_duration, report
 
 # Large volontairement : 401/403 = endpoints protégés, 500 = crash. Les filtrer
@@ -55,10 +75,16 @@ Log = Callable[[Optional[str]], None]
 # --------------------------------------------------------------------------- #
 
 
+# Archives : gau et waybackurls interrogent les mêmes sources publiques qu'urlfinder.
+GAU_BLACKLIST = "png,jpg,jpeg,gif,svg,ico,webp,bmp,css,woff,woff2,ttf,eot,otf,mp3,mp4,webm"
+AMASS_SUBS_TIMEOUT = 120  # s : lecture des noms dans la base amass (rapide)
+ARCHIVE_MODULES = ("gau", "waybackurls")  # ordre de fusion dans la carte
+
+
 @dataclass
 class Options:
     target: str
-    all_sources: bool = False
+    all_sources: bool = default_param("subfinder", "all_sources")
     subdomains: str = ""
     wildcard_filter: bool = True
     match_codes: str = DEFAULT_MATCH_CODES
@@ -74,9 +100,9 @@ class Options:
     urlfinder_all: bool = True
     urlfinder_retries: int = 1
     urlfinder_retry_wait: int = 30
-    threads: int = 50
-    rate_limit: int = 150
-    concurrency: int = 10
+    threads: int = default_param("httpx", "threads")
+    rate_limit: int = MODULE_DEFAULTS["httpx"].rate
+    concurrency: int = default_param("katana", "concurrency")
     httpx_bin: Optional[str] = None
     revalidate: bool = True
     tree_report: bool = True
@@ -85,8 +111,8 @@ class Options:
     nuclei_mode: str = "auto"
     nuclei_passes: str = "1,2"              # « 1 », « 2 » ou « 1,2 » (voir resolve_nuclei_passes)
     nuclei_severity: str = "medium,high,critical"
-    nuclei_rate_limit: int = 50             # passe 1 : partage le budget avec katana
-    nuclei2_rate_limit: int = 150           # passe 2 : fin de pipeline, presque seule
+    nuclei_rate_limit: int = MODULE_DEFAULTS["nuclei1"].rate             # passe 1 : partage le budget avec katana
+    nuclei2_rate_limit: int = MODULE_DEFAULTS["nuclei2"].rate           # passe 2 : fin de pipeline, presque seule
     nuclei_waf_factor: float = 0.3          # débit des hôtes derrière WAF/CDN = accordé × facteur
     nuclei_k: int = 2                       # URLs gardées par signature (passe 2)
     nuclei_priority: bool = True            # passe 2 : run « exposition » sur les chemins sensibles
@@ -94,10 +120,32 @@ class Options:
     nuclei_timeout: int = 5
     nuclei_concurrency: int = 25
     nuclei_retries: int = 1
+    # Sources de sous-domaines et d'URLs historiques (tout actif par défaut).
+    crtsh: bool = MODULE_DEFAULTS["crtsh"].enabled
+    crtsh_timeout: int = default_param("crtsh", "request_timeout")   # s, par requête
+    crtsh_retries: int = default_param("crtsh", "retries")
+    crtsh_backoff: float = default_param("crtsh", "backoff")         # s, doublé à chaque essai
+    amass: bool = MODULE_DEFAULTS["amass"].enabled
+    gau: bool = MODULE_DEFAULTS["gau"].enabled
+    gau_threads: int = default_param("gau", "threads")
+    gau_http_timeout: int = default_param("gau", "http_timeout")     # s, par requête
+    gau_providers: str = ""                                           # vide = ceux de gau
+    waybackurls: bool = MODULE_DEFAULTS["waybackurls"].enabled
+    archive_dedupe: bool = default_param("merge_map", "archive_dedupe")
+    archive_k: int = default_param("merge_map", "archive_k")
+    # Timeouts de module en secondes (None = illimité) : surcharge de `config.MODULE_DEFAULTS`.
+    timeouts: Dict[str, Optional[int]] = field(default_factory=dict)
+    skip_subfinder: bool = False
     skip_dnsx: bool = False
     skip_urlfinder: bool = False
     skip_httpx: bool = False
     skip_katana: bool = False
+
+    def module_timeout(self, name: str) -> Optional[int]:
+        """Timeout (s) du module : option CLI si fournie, sinon défaut de `config`."""
+        if name in self.timeouts:
+            return self.timeouts[name]
+        return MODULE_DEFAULTS[name].timeout
 
     def nuclei_pass_enabled(self, number: int) -> bool:
         """La passe `number` (1 ou 2) est-elle active ? Toujours False sans -n."""
@@ -183,12 +231,60 @@ def load_provided_subdomains(spec: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 
-def stage_subfinder(target: str, destination: Path, all_sources: bool, timeout: Optional[int] = None) -> Tuple[int, float]:
-    command = ["subfinder", "-d", target, "-o", str(destination)]
+def stage_subfinder(
+    domains: "Sequence[str] | str", destination: Path, all_sources: bool, timeout: Optional[int] = None
+) -> Tuple[int, float]:
+    """subfinder sur un ou plusieurs apex (un `-d` par apex)."""
+    apexes = [domains] if isinstance(domains, str) else list(domains)
+    command = ["subfinder"]
+    for apex in apexes:
+        command += ["-d", apex]
+    command += ["-o", str(destination)]
     if all_sources:
         command.append("-all")
     _, elapsed, _ = runner.run_command(command, "subfinder", watch=destination, timeout=timeout)
     return write_lines(destination, read_lines(destination)), elapsed
+
+
+def stage_amass(
+    domains: Sequence[str],
+    destination: Path,
+    timeout_minutes: Optional[int] = None,
+    timeout: Optional[int] = None,
+) -> Tuple[int, float, int]:
+    """amass **passif**, en deux temps indépendants de la version (v4 et v5) :
+
+    1. `amass enum -passive -d … [-timeout N] -nocolor` remplit la base d'amass.
+       `-passive` est le défaut en v5 (option dépréciée mais acceptée) ; jamais
+       `-active` (zone transfers, certificats : trafic vers la cible). En v5 `enum`
+       n'a plus de `-o` (résultats sur la sortie standard) et `-timeout` est un délai
+       *sans progrès* (en v4, durée totale) : le vrai plafond est l'échéance du module.
+    2. `amass subs -names -d …` relit les noms de la base, un par ligne, capturés par
+       redirection de la sortie standard (pas de `-o`, pas de `-silent`, qui couperait
+       la sortie).
+
+    Pas de `-silent` ajouté par `run_command` pour la même raison (`silent=False`).
+    Retourne (noms, secondes, code de retour de `enum`).
+    """
+    joined = ",".join(domains)
+    enum = ["amass", "enum", "-passive", "-d", joined]
+    if timeout_minutes:
+        enum += ["-timeout", str(timeout_minutes)]
+    enum.append("-nocolor")
+    rc, elapsed, _ = runner.run_command(enum, "amass", silent=False, timeout=timeout)
+
+    raw = destination.with_name(destination.name + ".raw")
+    raw.unlink(missing_ok=True)
+    try:
+        _, elapsed_subs, _ = runner.run_command(
+            ["amass", "subs", "-names", "-d", joined, "-nocolor"], "amass subs",
+            watch=raw, stdout_to=raw, silent=False, timeout=AMASS_SUBS_TIMEOUT,
+        )
+        # « nom » ou « nom ip… » ; « No names were discovered » est écarté par clean_name.
+        names = [crtsh_client.clean_name(line.split()[0]) for line in read_lines(raw)]
+    finally:
+        raw.unlink(missing_ok=True)
+    return write_lines(destination, sorted({n for n in names if n})), elapsed + elapsed_subs, rc
 
 
 def stage_dnsx(source: Path, destination: Path, target: str, wildcard: bool, timeout: Optional[int] = None) -> Tuple[int, float]:
@@ -258,6 +354,57 @@ def stage_urlfinder(
     return count, total_elapsed, last_stderr
 
 
+def only_http(lines: Sequence[str]) -> List[str]:
+    return [line for line in lines if line.startswith(("http://", "https://"))]
+
+
+def stage_gau(
+    domains: Sequence[str],
+    destination: Path,
+    threads: int,
+    http_timeout: int,
+    providers: str = "",
+    timeout: Optional[int] = None,
+) -> Tuple[int, float, str]:
+    """gau (archives Wayback / CommonCrawl / OTX / urlscan) sur les apex, sous-domaines inclus.
+
+    Les URLs sortent sur la sortie standard, capturée dans `destination` (gau n'a pas
+    de `-silent` : `silent=False`). On évite `--o` : gau y *ajoute* (ouverture en append),
+    un fichier d'un run précédent serait complété au lieu d'être remplacé. `--blacklist`
+    écarte à la source les extensions statiques courantes ; le reste est trié à la fusion.
+    """
+    destination.unlink(missing_ok=True)
+    command = [
+        "gau", "--subs", "--threads", str(threads), "--timeout", str(http_timeout),
+        "--blacklist", GAU_BLACKLIST,
+    ]
+    if providers.strip():
+        command += ["--providers", providers.strip()]
+    command += list(domains)
+    _, elapsed, stderr = runner.run_command(
+        command, "gau", watch=destination, stdout_to=destination, silent=False, timeout=timeout
+    )
+    return write_lines(destination, only_http(read_lines(destination))), elapsed, stderr
+
+
+def stage_waybackurls(
+    domains: Sequence[str], destination: Path, domains_file: Path, timeout: Optional[int] = None
+) -> Tuple[int, float, str]:
+    """waybackurls : les domaines arrivent sur l'entrée standard (sans argument il lit un
+    domaine par ligne ; avec un argument il n'en prend qu'un seul). Sous-domaines inclus
+    (pas de `-no-subs`). Sortie standard → `destination`."""
+    destination.unlink(missing_ok=True)
+    write_lines(domains_file, list(domains))
+    try:
+        _, elapsed, stderr = runner.run_command(
+            ["waybackurls"], "waybackurls", watch=destination, stdout_to=destination,
+            stdin_from=domains_file, silent=False, timeout=timeout,
+        )
+    finally:
+        domains_file.unlink(missing_ok=True)
+    return write_lines(destination, only_http(read_lines(destination))), elapsed, stderr
+
+
 def stage_httpx(
     binary: str,
     source: Path,
@@ -272,6 +419,7 @@ def stage_httpx(
     timeout: Optional[int] = None,
     label: str = "httpx",
     cdn: bool = False,
+    split: bool = True,
 ) -> Tuple[int, int, int, float]:
     """Une passe httpx puis éclatement : `all_file` (annoté, tous codes retenus par
     -mc), `ok_file` (200 seuls) et `live_file` (URLs nues dont le code est dans
@@ -279,7 +427,11 @@ def stage_httpx(
 
     `cdn` ajoute `-cdn` (champs `cdn`, `cdn_name`, `cdn_type` dans le JSONL) : demandé
     seulement quand nuclei passe 1 est actif, pour ralentir derrière les WAF/CDN.
-    Sans lui, la commande est strictement celle d'avant."""
+    Sans lui, la commande est strictement celle d'avant.
+
+    `split=False` : seule la passe est lancée (le JSONL est écrit), l'éclatement en
+    listes est laissé à l'appelant — httpx #2 fusionne d'abord ses lignes avec celles
+    de httpx #1."""
     command = [
         binary,
         "-l",
@@ -303,6 +455,8 @@ def stage_httpx(
         str(jsonl_file),
     ]
     _, elapsed, _ = runner.run_command(command, label, watch=jsonl_file, timeout=timeout)
+    if not split:
+        return count_lines(jsonl_file), 0, 0, elapsed
     total, alive, live = split_httpx_output(jsonl_file, all_file, ok_file, live_file, live_codes)
     return total, alive, live, elapsed
 
@@ -426,8 +580,29 @@ def stage_nuclei(
 
 
 def _hosts_available(ctx: Context) -> bool:
-    """subfinder a rendu au moins un hôte en périmètre (sinon aval : rien à faire)."""
+    """`subdomains` a rendu au moins un hôte en périmètre (sinon aval : rien à faire).
+
+    (Clé d'état historique `subfinder_count` : avant les sources multiples, c'était le
+    décompte de subfinder.)"""
     return ctx.state.get("subfinder_count", 0) > 0
+
+
+def scope_apexes(ctx: Context) -> List[str]:
+    """Apex à énumérer : cible + `--in-scope` (l'apex de la cible si le périmètre est vide)."""
+    return list(ctx.scope.apexes) or [host_of(ctx.target) or ctx.target.strip().lower()]
+
+
+def note_raw_hosts(ctx: Context, source: str, count: int) -> None:
+    """Retient combien d'hôtes une source a rendus AVANT le filtre de périmètre
+    (pour que `subdomains` distingue « rien trouvé » de « rien dans le périmètre »)."""
+    with ctx.lock:
+        ctx.state.setdefault("raw_hosts", {})[source] = count
+
+
+def produced(ctx: Context, name: str) -> bool:
+    """Le module a réellement produit son fichier dans CE run (terminé ou en timeout) —
+    un fichier périmé d'un run précédent ne compte pas."""
+    return ctx.status(name) in (Status.DONE, Status.TIMEOUT)
 
 
 def ensure_httpx_input(ctx: Context) -> int:
@@ -438,7 +613,7 @@ def ensure_httpx_input(ctx: Context) -> int:
     """
     with ctx.lock:
         if "merged" not in ctx.state:
-            hosts_file = ctx.state.get("hosts_file", ctx.paths["subfinder"])
+            hosts_file = ctx.state.get("hosts_file", ctx.paths["subdomains"])
             merged = merge_files([hosts_file, ctx.paths["urlfinder"]], ctx.paths["httpx_input"])
             ctx.state["merged"] = merged
             ctx.log(f"\n[bold]Fusion des deux branches[/bold] → {merged} entrées")
@@ -487,6 +662,9 @@ def live_lists(ctx: Context) -> List[Path]:
 
 
 def run_subfinder(ctx: Context) -> ModuleResult:
+    """subfinder (`-all` par défaut) sur tous les apex du périmètre — ou la liste
+    `--subdomains`, qui le remplace. Un résultat vide n'est plus fatal ici : c'est
+    `subdomains` qui arrête le pipeline si AUCUNE source ne rend d'hôte."""
     o, paths = ctx.options, ctx.paths
     provided_hosts = load_provided_subdomains(o.subdomains)
     if provided_hosts:
@@ -494,17 +672,95 @@ def run_subfinder(ctx: Context) -> ModuleResult:
         ctx.log(report(count, paths["subfinder"], 0.0))
         ctx.log("  [dim]Liste fournie — étape subfinder ignorée.[/dim]")
     else:
-        count, elapsed = stage_subfinder(o.target, paths["subfinder"], o.all_sources, ctx.remaining())
+        count, elapsed = stage_subfinder(scope_apexes(ctx), paths["subfinder"], o.all_sources, ctx.remaining())
         ctx.log(report(count, paths["subfinder"], elapsed))
     raw_count = count
+    note_raw_hosts(ctx, "subfinder", raw_count)
     count = apply_scope(ctx.scope, paths["subfinder"], "subfinder", ctx.log)
+    note = ""
+    if not count:
+        note = "aucun sous-domaine dans le périmètre" if raw_count else "aucun sous-domaine trouvé"
+    return ModuleResult(count, note=note)
+
+
+def run_crtsh(ctx: Context) -> ModuleResult:
+    """Sous-domaines vus dans les certificats (crt.sh), un appel par apex du périmètre.
+
+    Pas de binaire : `urllib`. crt.sh est souvent lent ou en 5xx → délai par requête,
+    deux nouveaux essais avec délai croissant, et on s'arrête à l'échéance du module.
+    Un apex en échec n'empêche pas les autres ; tous en échec → module en échec (le
+    pipeline continue, `subdomains` se contente des autres sources)."""
+    o, paths = ctx.options, ctx.paths
+    paths["crtsh"].unlink(missing_ok=True)
+    domains = scope_apexes(ctx)
+    request_timeout = o.crtsh_timeout
+    if ctx.remaining() is not None:
+        request_timeout = max(min(request_timeout, ctx.remaining()), 1)
+    outcome = crtsh_client.fetch_domains(
+        domains,
+        request_timeout=request_timeout, retries=o.crtsh_retries, backoff=o.crtsh_backoff,
+        expired=lambda: ctx.deadline is not None and time.monotonic() >= ctx.deadline,
+        notice=lambda message: ctx.log(f"  {message}", now=True),
+    )
+    names, errors = outcome["names"], outcome["errors"]
+    for domain, message in errors.items():
+        ctx.log(f"  [yellow]crt.sh {domain} : {message}[/yellow]")
+    if errors and len(errors) == len(domains):
+        raise ModuleError("crt.sh : " + " ; ".join(f"{d} : {m}" for d, m in errors.items()))
+    raw_count = write_lines(paths["crtsh"], names)
+    note_raw_hosts(ctx, "crtsh", raw_count)
+    ctx.log(report(raw_count, paths["crtsh"], 0.0))
+    kept = apply_scope(ctx.scope, paths["crtsh"], "crtsh", ctx.log)
+    note = f"{len(errors)}/{len(domains)} apex en échec" if errors else ""
+    return ModuleResult(kept, note=note)
+
+
+def run_amass(ctx: Context) -> ModuleResult:
+    """amass passif sur les apex du périmètre (voir `stage_amass`). Peut être très long :
+    échéance du module = `--amass-timeout` (15 min par défaut). Au-delà, `enum` est tué
+    et les noms déjà en base sont quand même relus."""
+    o, paths = ctx.options, ctx.paths
+    paths["amass"].unlink(missing_ok=True)
+    limit = o.module_timeout("amass")
+    count, elapsed, rc = stage_amass(
+        scope_apexes(ctx), paths["amass"], math.ceil(limit / 60) if limit else None, ctx.remaining()
+    )
+    ctx.log(report(count, paths["amass"], elapsed))
+    note_raw_hosts(ctx, "amass", count)
+    if rc == 124:
+        ctx.log("  [yellow]amass enum interrompu à l'échéance — noms déjà trouvés conservés[/yellow]")
+    elif rc != 0 and not count:
+        raise ModuleError(f"amass enum a échoué (code {rc})")
+    kept = apply_scope(ctx.scope, paths["amass"], "amass", ctx.log)
+    return ModuleResult(kept)
+
+
+def run_subdomains(ctx: Context) -> ModuleResult:
+    """Fusion des sources de sous-domaines (subfinder, crtsh, amass) → `01_subdomains.txt`.
+
+    Seules les sources qui ont produit leur fichier dans CE run comptent. Dédoublonnage
+    insensible à la casse, puis périmètre. Si aucune source ne rend d'hôte en périmètre :
+    échec (tout l'aval est ignoré), comme l'arrêt historique de subfinder."""
+    paths = ctx.paths
+    merged: Dict[str, str] = {}   # clé minuscule -> première écriture
+    used: List[str] = []
+    for name in ("subfinder", "crtsh", "amass"):
+        if not (produced(ctx, name) and paths[name].exists()):
+            continue
+        lines = read_lines(paths[name])
+        used.append(f"{name} {len(lines)}")
+        for line in lines:
+            merged.setdefault(line.lower(), line)
+    raw_count = write_lines(paths["subdomains"], list(merged.values()))
+    ctx.log(report(raw_count, paths["subdomains"], 0.0))
+    count = apply_scope(ctx.scope, paths["subdomains"], "subdomains", ctx.log)
     if not count:
         # Les modules en aval constatent l'absence d'hôtes et s'ignorent proprement.
-        if raw_count:
+        if raw_count or sum(ctx.state.get("raw_hosts", {}).values()):
             raise ModuleError("Aucun sous-domaine dans le périmètre, arrêt.")
         raise ModuleError("Aucun sous-domaine trouvé, arrêt.")
     ctx.state["subfinder_count"] = count
-    return ModuleResult(count)
+    return ModuleResult(count, note=" · ".join(used))
 
 
 def run_dnsx(ctx: Context) -> ModuleResult:
@@ -512,13 +768,13 @@ def run_dnsx(ctx: Context) -> ModuleResult:
     if not _hosts_available(ctx):
         raise ModuleSkipped("aucun hôte en périmètre — rien à résoudre")
     ctx.log(eta_line(ctx.state["subfinder_count"], DNSX_NOMINAL_PER_SEC, "hôtes à résoudre"))
-    n, elapsed = stage_dnsx(paths["subfinder"], paths["dnsx"], o.target, o.wildcard_filter, ctx.remaining())
+    n, elapsed = stage_dnsx(paths["subdomains"], paths["dnsx"], o.target, o.wildcard_filter, ctx.remaining())
     ctx.log(report(n, paths["dnsx"], elapsed))
     n = apply_scope(ctx.scope, paths["dnsx"], "dnsx", ctx.log)
     if n:
         ctx.state["hosts_file"] = paths["dnsx"]
     else:
-        ctx.log("[yellow]dnsx sans résultat — on garde la liste subfinder[/yellow]")
+        ctx.log("[yellow]dnsx sans résultat — on garde la liste des sous-domaines[/yellow]")
     return ModuleResult(n)
 
 
@@ -559,6 +815,40 @@ def run_urlfinder(ctx: Context) -> ModuleResult:
             "  [dim]Pour du volume : laisser la fenêtre de quota se reposer, ou ajouter des clés "
             "d'API dans ~/.config/urlfinder/provider-config.yaml.[/dim]"
         )
+    return ModuleResult(kept)
+
+
+def _archive_hint(ctx: Context, tool: str, count: int) -> None:
+    if count < 500:
+        ctx.log(
+            f"  [yellow]Peu d'URLs[/yellow] — {tool} partage les archives (Wayback, CommonCrawl…) avec urlfinder, "
+            "souvent rate-limitées par IP : un résultat maigre est rarement une cible sans historique."
+        )
+
+
+def run_gau(ctx: Context) -> ModuleResult:
+    """gau : URLs d'archives publiques (hors cible). Lancé APRÈS urlfinder — mêmes
+    archives, déjà rate-limitées. Ces URLs ne sont PAS testées ici : `merge_map` les
+    réduit puis httpx #2 les valide ; elles n'alimentent jamais katana ni nuclei en direct."""
+    o, paths = ctx.options, ctx.paths
+    n, elapsed, _ = stage_gau(
+        scope_apexes(ctx), paths["gau"], o.gau_threads, o.gau_http_timeout, o.gau_providers, ctx.remaining()
+    )
+    ctx.log(report(n, paths["gau"], elapsed))
+    kept = apply_scope(ctx.scope, paths["gau"], "gau", ctx.log)
+    _archive_hint(ctx, "gau", n)
+    return ModuleResult(kept)
+
+
+def run_waybackurls(ctx: Context) -> ModuleResult:
+    """waybackurls : archive Wayback seule. Lancé APRÈS gau (voir `run_gau`)."""
+    paths = ctx.paths
+    n, elapsed, _ = stage_waybackurls(
+        scope_apexes(ctx), paths["waybackurls"], ctx.output / ".waybackurls_domains.tmp", ctx.remaining()
+    )
+    ctx.log(report(n, paths["waybackurls"], elapsed))
+    kept = apply_scope(ctx.scope, paths["waybackurls"], "waybackurls", ctx.log)
+    _archive_hint(ctx, "waybackurls", n)
     return ModuleResult(kept)
 
 
@@ -613,37 +903,122 @@ def run_katana(ctx: Context) -> ModuleResult:
     return ModuleResult(n)
 
 
+def reduce_archive(urls: Sequence[str], dedupe: bool, k: int) -> Tuple[List[str], Dict[str, int]]:
+    """URLs d'archive (gau, waybackurls) prêtes pour la carte : statiques exclues, puis,
+    si `dedupe`, K URLs par signature (gau peut rendre 100k+ lignes). Retourne
+    (URLs gardées, décomptes). Le périmètre est déjà appliqué par l'appelant."""
+    unique = list(dict.fromkeys(only_http([u.strip() for u in urls])))
+    dynamic = [u for u in unique if not signatures.is_static(u)]
+    kept = signatures.representatives(dynamic, k) if dedupe else dynamic
+    return kept, {"raw": len(unique), "static": len(unique) - len(dynamic), "kept": len(kept)}
+
+
+def build_map(
+    seeds: Optional[Path],
+    crawled: Sequence[Path],
+    archives: Sequence[Path],
+    destination: Path,
+    scope: ScopeFilter,
+    stage: str,
+    dedupe: bool = True,
+    k: int = 3,
+    log: Log = console.print,
+) -> Tuple[int, Dict[str, int], List[str]]:
+    """Carte des URLs = seeds vivantes + crawl katana + archives réduites → `destination`,
+    puis périmètre strict. Partagé par le module `merge_map` et par `recon_mano merge`.
+
+    Les archives passent par : périmètre → statiques exclues → K par signature (si
+    `dedupe`). Seeds et crawl sont repris tels quels. Retourne (URLs en carte, décomptes
+    des archives : raw = en entrée, static = statiques écartées, kept = gardées, et la
+    liste des URLs qui ne sont entrées dans la carte QUE par les archives — jamais
+    testées, donc à ne pas confier à nuclei tant qu'httpx #2 ne les a pas validées)."""
+    archive_urls: List[str] = []
+    for path in archives:
+        archive_urls.extend(only_http(read_lines(path)))
+    archive_urls = list(dict.fromkeys(archive_urls))
+    in_scope = scope.filter(archive_urls, stage) if archive_urls else []
+    reduced, stats = reduce_archive(in_scope, dedupe, k)
+    stats["raw"] = len(archive_urls)
+    lines: List[str] = []
+    for path in ([seeds] if seeds else []) + list(crawled):
+        lines.extend(read_lines(path))
+    write_lines(destination, lines + reduced)
+    total = apply_scope(scope, destination, stage, log)
+    known = set(lines)
+    return total, stats, [u for u in reduced if u not in known]
+
+
 def run_merge_map(ctx: Context) -> ModuleResult:
-    """Carte finale = seeds vivantes + crawl katana, puis périmètre strict : les
-    archives et le crawl font entrer des hôtes tiers, on les écarte avant httpx #2
-    et surtout avant nuclei."""
-    paths = ctx.paths
+    """Carte finale = seeds vivantes + crawl katana + archives gau/waybackurls réduites,
+    puis périmètre strict : les archives et le crawl font entrer des hôtes tiers, on les
+    écarte avant httpx #2 et surtout avant nuclei. Attend katana ET la chaîne d'archives."""
+    o, paths = ctx.options, ctx.paths
     if not _hosts_available(ctx):
         raise ModuleSkipped("aucun hôte en périmètre — pas de carte")
     seeds, _ = katana_seeds(ctx)
-    # 06_katana.txt d'un run précédent peut traîner sur le disque : on ne l'utilise que
-    # si katana a réellement produit ce fichier dans CE run (terminé ou en timeout).
-    crawled = [paths["katana"]] if ctx.status("katana") in (Status.DONE, Status.TIMEOUT) else []
-    merge_files(([seeds] if seeds else []) + crawled, paths["all_urls"])
-    total = apply_scope(ctx.scope, paths["all_urls"], "all_urls", ctx.log)
+    # Les fichiers d'un run précédent peuvent traîner sur le disque : on n'utilise que ceux
+    # que leur module a réellement produits dans CE run (terminé ou en timeout).
+    crawled = [paths["katana"]] if produced(ctx, "katana") else []
+    archives = [paths[name] for name in ARCHIVE_MODULES if produced(ctx, name) and paths[name].exists()]
+    total, stats, archive_only = build_map(
+        seeds, crawled, archives, paths["all_urls"], ctx.scope, "all_urls",
+        o.archive_dedupe, o.archive_k, ctx.log,
+    )
     ctx.state["map_total"] = total
-    return ModuleResult(total)
+    ctx.state["archive_only"] = set(archive_only)
+    note = ""
+    if archives:
+        mode = f"K={o.archive_k}" if o.archive_dedupe else "sans réduction"
+        note = f"archives {stats['raw']} → {stats['kept']} ({mode}, {stats['static']} statiques)"
+    return ModuleResult(total, note=note)
 
 
 def run_httpx2(ctx: Context) -> ModuleResult:
-    """katana découvre des URLs par crawl mais ne connaît PAS leur code HTTP.
-    On re-teste la carte pour obtenir les statuts réels + la liste complète des
-    200 (archives ET découvertes katana), et une surface vivante propre."""
-    paths = ctx.paths
+    """katana découvre des URLs par crawl mais ne connaît PAS leur code HTTP, et les
+    archives (gau, waybackurls) n'ont été testées par personne. httpx #2 ne teste QUE les
+    URLs de la carte absentes de `05_httpx.jsonl` (champs `url`/`input` : les seeds
+    d'httpx #1 sont déjà validées) ; `08_httpx2.jsonl` ne contient donc que les nouvelles
+    lignes et `08_httpx2_input.txt` ce qui lui a été envoyé. Les listes finales sont
+    ensuite construites sur l'union des lignes #1 (URLs de la carte) et #2 : statuts
+    réels, liste complète des 200 et surface vivante propre."""
+    o, paths = ctx.options, ctx.paths
     total = ctx.state.get("map_total", 0)
     if not total:
         raise ModuleSkipped("carte vide — rien à revalider")
-    total_v, _, _ = _run_httpx_pass(
-        ctx, paths["all_urls"], paths["httpx2_jsonl"], paths["urls_all_final"],
-        paths["urls_200_final"], paths["urls_live_final"], total, "httpx #2",
+    map_urls = read_lines(paths["all_urls"])
+    map_set = set(map_urls)
+    # httpx #1 de CE run seulement : un 05_httpx.jsonl périmé ne doit rien « valider ».
+    first_rows = list(iter_httpx_rows(read_lines(paths["httpx_jsonl"]))) if ctx.state.get("httpx_ran") else []
+    seen = seen_urls(first_rows)
+    todo = [u for u in map_urls if u not in seen]
+    write_lines(paths["httpx2_input"], todo)
+    paths["httpx2_jsonl"].unlink(missing_ok=True)
+    reused = len(map_urls) - len(todo)
+    ctx.log(f"  [dim]{len(map_urls)} URLs en carte · {reused} déjà validées par httpx #1 · {len(todo)} à tester[/dim]")
+    elapsed = 0.0
+    if todo:
+        ctx.log(eta_line(len(todo), ctx.rate, f"requêtes @ {ctx.rate}/s (plancher)"))
+        _, _, _, elapsed = stage_httpx(
+            ctx.state["httpx_path"], paths["httpx2_input"], paths["httpx2_jsonl"], paths["urls_all_final"],
+            paths["urls_200_final"], paths["urls_live_final"], o.match_codes, o.threads, ctx.rate,
+            o.live_code_set, ctx.remaining(), "httpx #2", split=False,
+        )
+    else:
+        paths["httpx2_jsonl"].write_text("", encoding="utf-8")
+    new_rows = list(iter_httpx_rows(read_lines(paths["httpx2_jsonl"])))
+    rows = union_rows(first_rows, new_rows, only=map_set)
+    total_v, alive, live = split_httpx_rows(
+        rows, paths["urls_all_final"], paths["urls_200_final"], paths["urls_live_final"], o.live_code_set
     )
+    ctx.log(report(total_v, paths["urls_all_final"], elapsed))
+    ctx.log(f"  [green]→ {alive} en 200[/green] · {paths['urls_200_final'].name}")
+    ctx.log(f"  [green]→ {live} vivants ({o.live_codes})[/green] · {paths['urls_live_final'].name}")
+    # Défense en profondeur : la carte est déjà dans le périmètre, les listes finales aussi.
+    total_v = apply_scope(ctx.scope, paths["urls_all_final"], "httpx2", ctx.log)
+    for key in ("urls_200_final", "urls_live_final"):
+        apply_scope(ctx.scope, paths[key], "httpx2", lambda message: None)
     ctx.state["httpx2_ran"] = True
-    return ModuleResult(total_v)
+    return ModuleResult(total_v, note=f"{len(todo)} testées · {reused} réutilisées")
 
 
 def run_tree(ctx: Context) -> ModuleResult:
@@ -744,7 +1119,9 @@ def _nuclei2_candidates(ctx: Context) -> List[str]:
             break
     if not live_urls and not lists:
         live_all_file, _ = final_lists(ctx)
-        live_urls = clean_live_urls(live_all_file, paths["all_urls"])
+        # Repli (--skip-httpx…) : la carte brute, MOINS les URLs d'archive que personne n'a testées.
+        unvalidated = ctx.state.get("archive_only", set())
+        live_urls = [u for u in clean_live_urls(live_all_file, paths["all_urls"]) if u not in unvalidated]
     before = len(live_urls)
     live_urls = ctx.scope.filter(live_urls, "nuclei2")
     if before != len(live_urls):
@@ -846,29 +1223,60 @@ def finalize_nuclei(ctx: Context) -> Optional[Dict[str, int]]:
 
 def build_modules(o: Options) -> List[Module]:
     """Le DAG du pipeline. L'ordre de déclaration est l'ordre de priorité (et
-    celui du mode --sequential)."""
+    celui du mode --sequential). États et timeouts par défaut : `config.MODULE_DEFAULTS`,
+    surchargés par les options."""
     provided = bool(load_provided_subdomains(o.subdomains))
     uf_mode = "toutes sources (-all)" if o.urlfinder_all else "sources curées"
     icon = STAGE_ICONS.get
+    timeout = o.module_timeout
     return [
         Module(
             "subfinder", [], run_subfinder,
             binaries=[] if provided else ["subfinder"],
+            # Avec --subdomains, ce module ne fait que charger la liste : --skip-subfinder ne la perd pas.
+            enabled=provided or not o.skip_subfinder, timeout=timeout("subfinder"),
             icon=icon("subfinder", "•"),
-            desc="sous-domaines fournis (--subdomains)" if provided else "sous-domaines théoriques",
+            desc="sous-domaines fournis (--subdomains)" if provided
+            else f"sous-domaines théoriques{' · -all' if o.all_sources else ''}",
+        ),
+        # Sources de sous-domaines sans dépendance : elles tournent en parallèle de subfinder.
+        Module(
+            "crtsh", [], run_crtsh, enabled=o.crtsh, timeout=timeout("crtsh"),
+            icon=icon("crtsh", "•"), desc="sous-domaines des certificats (crt.sh, sans binaire)",
         ),
         Module(
-            "dnsx", ["subfinder"], run_dnsx, binaries=["dnsx"], enabled=not o.skip_dnsx,
-            icon=icon("dnsx", "•"), desc="validation DNS + filtrage wildcard",
+            "amass", [], run_amass, binaries=["amass"], enabled=o.amass, timeout=timeout("amass"),
+            icon=icon("amass", "•"), desc="sous-domaines · amass enum passif",
+        ),
+        Module(
+            "subdomains", ["subfinder", "crtsh", "amass"], run_subdomains,
+            icon=icon("subdomains", "•"), desc="fusion subfinder + crtsh + amass · périmètre",
+        ),
+        Module(
+            "dnsx", ["subdomains"], run_dnsx, binaries=["dnsx"], enabled=not o.skip_dnsx,
+            timeout=timeout("dnsx"), icon=icon("dnsx", "•"), desc="validation DNS + filtrage wildcard",
         ),
         # urlfinder part de l'apex seul : aucune dépendance, il tourne en parallèle des hôtes.
         Module(
             "urlfinder", [], run_urlfinder, binaries=["urlfinder"], enabled=not o.skip_urlfinder,
-            icon=icon("urlfinder", "•"), desc=f"chemins historiques (apex) · {uf_mode}",
+            timeout=timeout("urlfinder"), icon=icon("urlfinder", "•"),
+            desc=f"chemins historiques (apex) · {uf_mode}",
+        ),
+        # Archives sérialisées : urlfinder → gau → waybackurls interrogent les mêmes sources
+        # publiques (Wayback, CommonCrawl), déjà rate-limitées par IP. Chacune démarre quand
+        # la précédente est terminée, mais toute la chaîne tourne en parallèle des hôtes.
+        Module(
+            "gau", ["urlfinder"], run_gau, binaries=["gau"], enabled=o.gau, timeout=timeout("gau"),
+            icon=icon("gau", "•"), desc="URLs d'archives (gau) · après urlfinder",
+        ),
+        Module(
+            "waybackurls", ["gau"], run_waybackurls, binaries=["waybackurls"], enabled=o.waybackurls,
+            timeout=timeout("waybackurls"), icon=icon("waybackurls", "•"),
+            desc="URLs de la Wayback Machine · après gau",
         ),
         Module(
             "httpx", ["dnsx", "urlfinder"], run_httpx, binaries=["httpx"], enabled=not o.skip_httpx,
-            network=True, rate=o.rate_limit,
+            network=True, rate=o.rate_limit, timeout=timeout("httpx"),
             icon=icon("httpx", "•"), desc="validation + annotation (une seule passe)",
         ),
         # nuclei1 AVANT katana : quand les deux deviennent prêts dans le même tour de
@@ -876,23 +1284,24 @@ def build_modules(o: Options) -> List[Module]:
         # reçoit le reste (150 -> 100). Désactivé (sans -n) : aucun budget consommé.
         Module(
             "nuclei1", ["httpx"], run_nuclei1, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(1),
-            network=True, rate=o.nuclei_rate_limit, label="nuclei #1",
+            network=True, rate=o.nuclei_rate_limit, timeout=timeout("nuclei1"), label="nuclei #1",
             icon=icon("nuclei1", "•"), desc=f"passe 1 · par hôte · mode {o.nuclei_mode} (‖ katana)",
         ),
         Module(
             "katana", ["httpx"], run_katana, binaries=["katana"], enabled=not o.skip_katana,
-            network=True, rate=o.rate_limit,
+            network=True, rate=o.rate_limit, timeout=timeout("katana"),
             icon=icon("katana", "•"), desc="crawl actif depuis les seeds vivantes",
         ),
         Module(
-            "merge_map", ["katana"], run_merge_map,
-            icon=icon("merge_map", "•"), desc="carte finale (seeds + crawl) + périmètre strict",
+            "merge_map", ["katana", "gau", "waybackurls"], run_merge_map,
+            icon=icon("merge_map", "•"), desc="carte finale (seeds + crawl + archives) + périmètre strict",
         ),
+        # Valide aussi les URLs d'archive (jamais testées avant) : actif même sans katana.
         Module(
             "httpx2", ["merge_map"], run_httpx2, binaries=["httpx"],
-            enabled=o.revalidate and not o.skip_katana and not o.skip_httpx,
-            network=True, rate=o.rate_limit, label="httpx #2",
-            icon=icon("httpx2", "•"), desc="validation de la carte crawlée (codes réels)",
+            enabled=o.revalidate and not o.skip_httpx,
+            network=True, rate=o.rate_limit, timeout=timeout("httpx2"), label="httpx #2",
+            icon=icon("httpx2", "•"), desc="validation des URLs de la carte absentes d'httpx #1",
         ),
         Module(
             "tree", ["httpx2"], run_tree, enabled=o.tree_report,
@@ -900,7 +1309,7 @@ def build_modules(o: Options) -> List[Module]:
         ),
         Module(
             "nuclei2", ["httpx2"], run_nuclei2, binaries=["nuclei"], enabled=o.nuclei_pass_enabled(2),
-            network=True, rate=o.nuclei2_rate_limit, label="nuclei #2",
+            network=True, rate=o.nuclei2_rate_limit, timeout=timeout("nuclei2"), label="nuclei #2",
             icon=icon("nuclei2", "•"), desc=f"passe 2 · URLs représentantes (K={o.nuclei_k}) · DAST + exposition",
         ),
     ]
